@@ -1,0 +1,28 @@
+# Параметры генерации массинга
+site:
+  input: site.dwg
+  region: moscow          # Регион для нормативной базы
+  latitude: 55.75         # Широта (для расчёта инсоляции)
+
+constraints:
+  max_density: 2.5        # Макс. плотность застройки
+  target_area: 45000      # Целевая продаваемая площадь, м²
+  max_floors: 25          # Макс. этажность
+  min_floor_height: 3.0   # Высота этажа, м
+
+setbacks:                 # Отступы от границ участка, м
+  default: 6
+  road: 10
+
+fire_safety:
+  min_distance: 12        # Мин. противопожарный разрыв, м
+
+insolation:
+  standard: "СанПиН"      # Норматив
+  min_hours: 2.0          # Мин. часы инсоляции
+
+output:
+  format: dwg             # dwg или dxf
+  layers:
+    buildings: "MASSING_BUILDINGS"
+    info: "MASSING_INFO"
