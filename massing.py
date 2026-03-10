@@ -146,11 +146,37 @@ def compute_buildable_area(site_data: dict, config: dict) -> dict:
     }
 
 
-def generate_building_slots(site_data: dict, config: dict,
-                             building_sizes: list[tuple[float, float]] = None) -> list[dict]:
+def _make_l_shape(cx, cy, wing_w, wing_h, depth):
+    """Создаёт Г-образный полигон."""
+    return Polygon([
+        (cx - wing_w/2, cy - wing_h/2),
+        (cx + wing_w/2, cy - wing_h/2),
+        (cx + wing_w/2, cy - wing_h/2 + depth),
+        (cx - wing_w/2 + depth, cy - wing_h/2 + depth),
+        (cx - wing_w/2 + depth, cy + wing_h/2),
+        (cx - wing_w/2, cy + wing_h/2),
+    ])
+
+
+def _make_u_shape(cx, cy, total_w, total_h, depth, gap):
+    """Создаёт П-образный полигон (двор внутри)."""
+    hw, hh = total_w/2, total_h/2
+    return Polygon([
+        (cx - hw, cy - hh),
+        (cx + hw, cy - hh),
+        (cx + hw, cy + hh),
+        (cx + hw - depth, cy + hh),
+        (cx + hw - depth, cy - hh + depth),
+        (cx - hw + depth, cy - hh + depth),
+        (cx - hw + depth, cy + hh),
+        (cx - hw, cy + hh),
+    ])
+
+
+def generate_building_slots(site_data: dict, config: dict) -> list[dict]:
     """
     Генерирует сетку допустимых позиций для зданий внутри buildable polygon.
-    Возвращает список слотов с координатами footprint.
+    Включает прямоугольные, Г-образные и П-образные здания.
     """
     import numpy as np
     from shapely.geometry import box
@@ -160,57 +186,53 @@ def generate_building_slots(site_data: dict, config: dict,
     buildable = buildable_info["polygon"]
     fire_dist = config.get("fire_safety", {}).get("min_distance", 12)
 
-    if building_sizes is None:
-        building_sizes = [
-            (60, 18),   # Секционный дом (длинный)
-            (45, 18),   # Секционный дом (средний)
-            (30, 18),   # Секционный дом (короткий)
-            (24, 24),   # Точечный дом (башня)
-        ]
+    bounds = buildable.bounds
 
-    bounds = buildable.bounds  # (minx, miny, maxx, maxy)
-    slots = []
-    slot_id = 1
-
-    # Определяем основное направление участка (ориентация)
-    # Используем minimum rotated rectangle для определения угла
+    # Определяем основное направление участка
     mrr = buildable.minimum_rotated_rectangle
     mrr_coords = list(mrr.exterior.coords)
     edge1 = np.array(mrr_coords[1]) - np.array(mrr_coords[0])
     edge2 = np.array(mrr_coords[2]) - np.array(mrr_coords[1])
-    # Длинная сторона определяет направление
     if np.linalg.norm(edge1) > np.linalg.norm(edge2):
         main_angle = np.degrees(np.arctan2(edge1[1], edge1[0]))
     else:
         main_angle = np.degrees(np.arctan2(edge2[1], edge2[0]))
 
-    # Шаг сетки — максимальный размер здания + пожарный разрыв
-    max_size = max(max(s) for s in building_sizes)
-    grid_step = max_size + fire_dist
+    slots = []
+    slot_id = 1
 
-    # Генерируем сетку точек внутри buildable polygon
-    x_range = np.arange(bounds[0] + max_size/2, bounds[2] - max_size/2, grid_step)
-    y_range = np.arange(bounds[1] + max_size/2, bounds[3] - max_size/2, grid_step)
+    # Плотная сетка: шаг = ширина здания + пожарный разрыв
+    grid_step = 18 + fire_dist  # 30 м — по глубине секции
 
-    for bw, bh in building_sizes:
+    x_range = np.arange(bounds[0] + 40, bounds[2] - 40, grid_step)
+    y_range = np.arange(bounds[1] + 40, bounds[3] - 40, grid_step)
+
+    # Типы зданий
+    building_templates = [
+        # (тип, описание, генератор полигона)
+        ("rect", "80x16 секционный", lambda cx, cy: box(cx-40, cy-8, cx+40, cy+8)),
+        ("rect", "60x16 секционный", lambda cx, cy: box(cx-30, cy-8, cx+30, cy+8)),
+        ("rect", "45x16 секционный", lambda cx, cy: box(cx-22.5, cy-8, cx+22.5, cy+8)),
+        ("rect", "20x20 башня", lambda cx, cy: box(cx-10, cy-10, cx+10, cy+10)),
+        ("L", "Г-образный 45x45", lambda cx, cy: _make_l_shape(cx, cy, 45, 45, 16)),
+        ("U", "П-образный 60x45", lambda cx, cy: _make_u_shape(cx, cy, 60, 45, 16, 28)),
+    ]
+
+    for bt_type, bt_desc, bt_gen in building_templates:
         for cx in x_range:
             for cy in y_range:
-                # Создаём footprint здания с центром в (cx, cy)
-                half_w, half_h = bw / 2, bh / 2
-                building_box = box(cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+                shape = bt_gen(cx, cy)
+                rotated = rotate(shape, main_angle, origin='centroid')
 
-                # Поворачиваем по направлению участка
-                rotated = rotate(building_box, main_angle, origin='centroid')
-
-                # Проверяем что здание полностью внутри buildable area
                 if buildable.contains(rotated):
-                    fp = list(rotated.exterior.coords)[:-1]  # без замыкающей точки
+                    fp = list(rotated.exterior.coords)[:-1]
                     slots.append({
                         "slot_id": slot_id,
                         "center": [round(cx, 1), round(cy, 1)],
-                        "size": f"{bw}x{bh}",
+                        "type": bt_type,
+                        "size": bt_desc,
                         "footprint": [[round(p[0], 1), round(p[1], 1)] for p in fp],
-                        "area_m2": round(bw * bh, 0),
+                        "area_m2": round(rotated.area, 0),
                         "orientation_deg": round(main_angle, 1),
                     })
                     slot_id += 1
@@ -255,10 +277,16 @@ def build_prompt(site_data: dict, config: dict, slots: list[dict] = None) -> str
 - Регион: {region}, широта: {latitude}° — учитывай инсоляцию
 
 ## Задача
-Выбери слоты и назначь этажность для каждого. Цель: максимум продаваемой площади при соблюдении плотности.
-Предпочитай длинные секционные дома (60x18, 45x18) — они типичнее для жилых кварталов.
-Распределяй здания по всей территории, не скапливай в одном месте.
-Варьируй этажность: от 9 до {constraints.get('max_floors', 25)} этажей.
+Выбери 15-25 слотов и назначь этажность. Цель: плотная квартальная застройка, максимум продаваемой площади.
+
+Правила:
+- Формируй дворовые пространства: группируй 3-4 здания вокруг двора (секционные + Г/П-образные)
+- Предпочитай длинные секционные дома (80x16, 60x16) и Г/П-образные — это реальная застройка
+- Башни (20x20) — как акценты на углах или входах, не больше 2-3 штук
+- Распределяй по ВСЕЙ территории равномерно
+- Варьируй этажность: 9-{constraints.get('max_floors', 25)} этажей (выше в центре, ниже по краям)
+- ВАЖНО: не выбирай слоты, которые пересекаются (проверяй footprint координаты!)
+- Выбирай МНОГО зданий (15-25), не жадничай
 
 ## Формат ответа
 Верни ТОЛЬКО валидный JSON (без markdown):
@@ -326,7 +354,7 @@ def generate_massing(prompt: str, api_key: str = None, base_url: str = None) -> 
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=4096,
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     )
 
