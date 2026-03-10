@@ -388,21 +388,72 @@ def generate_courtyard_blocks(site_data: dict, config: dict) -> list[dict]:
 
             buildings_in_block = []
 
-            # Верхняя секция (длинная, вся ширина блока)
-            top = box(cx - hw, cy + hh - d, cx + hw, cy + hh)
-            # Нижняя секция (может быть короче, но в пределах блока)
-            bot_shrink = random.choice([0, 0.15, 0.25])
-            bottom = box(cx - hw * (1 - bot_shrink), cy - hh,
-                         cx + hw * (1 - bot_shrink), cy - hh + d)
-            # Левая секция (боковая)
-            left = box(cx - hw, cy - hh + d, cx - hw + d, cy + hh - d)
-            # Правая секция (боковая, может отсутствовать → открытый квартал)
-            right = box(cx + hw - d, cy - hh + d, cx + hw, cy + hh - d)
+            # Выбираем схему квартала (classic чаще — надёжнее проходит валидацию)
+            scheme = random.choices(
+                ["classic", "l_corners", "u_wrap"],
+                weights=[60, 25, 15],
+                k=1
+            )[0]
 
-            # Некоторые кварталы — открытые (без одной стороны)
-            sections = [("top", top), ("bottom", bottom), ("left", left)]
-            if random.random() > 0.3:  # 70% — закрытые кварталы
-                sections.append(("right", right))
+            if scheme == "l_corners":
+                # Два Г-образных здания (углы) + 1-2 прямые секции
+                # Уменьшенные крылья чтобы влезать в зону
+                wing = hh * 0.55  # длина крыла ~55% от полувысоты блока
+                # Верхний левый угол (Г-образный)
+                tl = Polygon([
+                    (cx - hw, cy + hh),
+                    (cx - hw + d + wing, cy + hh),
+                    (cx - hw + d + wing, cy + hh - d),
+                    (cx - hw + d, cy + hh - d),
+                    (cx - hw + d, cy + hh - wing),
+                    (cx - hw, cy + hh - wing),
+                ])
+                # Нижний правый угол (Г-образный)
+                br = Polygon([
+                    (cx + hw, cy - hh),
+                    (cx + hw - d - wing, cy - hh),
+                    (cx + hw - d - wing, cy - hh + d),
+                    (cx + hw - d, cy - hh + d),
+                    (cx + hw - d, cy - hh + wing),
+                    (cx + hw, cy - hh + wing),
+                ])
+                # Прямые секции для заполнения оставшихся сторон
+                top_fill = box(cx - hw + d + wing, cy + hh - d, cx + hw, cy + hh)
+                bot_fill = box(cx - hw, cy - hh, cx + hw - d - wing, cy - hh + d)
+                sections = [("l_corner_tl", tl), ("l_corner_br", br),
+                           ("top_fill", top_fill)]
+                if random.random() > 0.4:
+                    sections.append(("bot_fill", bot_fill))
+
+            elif scheme == "u_wrap":
+                # П-образное: три стороны квартала одним зданием
+                u_shape = Polygon([
+                    (cx - hw, cy - hh),
+                    (cx + hw, cy - hh),
+                    (cx + hw, cy + hh - d),
+                    (cx + hw - d, cy + hh - d),
+                    (cx + hw - d, cy - hh + d),
+                    (cx - hw + d, cy - hh + d),
+                    (cx - hw + d, cy + hh - d),
+                    (cx - hw, cy + hh - d),
+                ])
+                # Отдельная секция сверху (закрывает двор)
+                closer = box(cx - hw, cy + hh - d, cx + hw, cy + hh)
+                sections = [("u_wrap", u_shape)]
+                if random.random() > 0.4:
+                    sections.append(("closer", closer))
+
+            else:
+                # Classic — прямоугольные секции (как раньше)
+                top = box(cx - hw, cy + hh - d, cx + hw, cy + hh)
+                bot_shrink = random.choice([0, 0.15, 0.25])
+                bottom = box(cx - hw * (1 - bot_shrink), cy - hh,
+                             cx + hw * (1 - bot_shrink), cy - hh + d)
+                left = box(cx - hw, cy - hh + d, cx - hw + d, cy + hh - d)
+                right = box(cx + hw - d, cy - hh + d, cx + hw, cy + hh - d)
+                sections = [("top", top), ("bottom", bottom), ("left", left)]
+                if random.random() > 0.3:
+                    sections.append(("right", right))
 
             for label, shape in sections:
                 rotated = rotate(shape, main_angle, origin=(cx, cy))
@@ -817,11 +868,22 @@ def generate_massing(prompt: str, api_key: str = None, base_url: str = None) -> 
 
     client = Anthropic(**client_kwargs)
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    # Retry на connection errors (VPS прокси может дропнуть)
+    import time as _time
+    for attempt in range(3):
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=8192,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            break
+        except Exception as e:
+            if "Connection" in str(type(e).__name__) and attempt < 2:
+                print(f"  Ошибка соединения, повтор через 5с... ({e.__class__.__name__})")
+                _time.sleep(5)
+                continue
+            raise
 
     text = response.content[0].text
 
