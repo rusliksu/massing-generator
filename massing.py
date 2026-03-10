@@ -440,6 +440,58 @@ def generate_courtyard_blocks(site_data: dict, config: dict) -> list[dict]:
     return blocks
 
 
+def generate_internal_roads(blocks: list[dict], site_data: dict) -> list[dict]:
+    """
+    Генерирует внутренние проезды между квартальными блоками.
+    Соединяет центры соседних блоков полосами шириной 7м.
+    """
+    from shapely.geometry import LineString
+    import numpy as np
+
+    if len(blocks) < 2:
+        return []
+
+    site_poly = Polygon(site_data["coordinates"])
+    centers = [(b["center"][0], b["center"][1]) for b in blocks]
+
+    roads = []
+    connected = set()
+
+    # Соединяем каждый блок с ближайшими 2 соседями
+    for i, c1 in enumerate(centers):
+        distances = []
+        for j, c2 in enumerate(centers):
+            if i == j:
+                continue
+            d = np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+            distances.append((j, d))
+        distances.sort(key=lambda x: x[1])
+
+        for j, dist in distances[:2]:
+            pair = tuple(sorted([i, j]))
+            if pair in connected:
+                continue
+            connected.add(pair)
+
+            c2 = centers[j]
+            line = LineString([c1, c2])
+            road_poly = line.buffer(3.5)  # 7м ширина
+
+            # Обрезаем по границе участка
+            road_clipped = road_poly.intersection(site_poly)
+            if road_clipped.is_empty or road_clipped.area < 10:
+                continue
+
+            roads.append({
+                "from_block": blocks[i]["block_id"],
+                "to_block": blocks[j]["block_id"],
+                "polygon": road_clipped,
+                "length_m": round(dist, 1),
+            })
+
+    return roads
+
+
 def generate_building_slots(site_data: dict, config: dict) -> list[dict]:
     """
     Генерирует сетку допустимых позиций для зданий внутри buildable polygon.
@@ -1141,6 +1193,11 @@ def write_massing_to_dxf(massing: dict, site_data: dict, output_path: str):
     doc.layers.add("SITE_BOUNDARY", color=7)       # Белый — граница участка
     doc.layers.add("MASSING_BUILDINGS", color=1)    # Красный — здания
     doc.layers.add("MASSING_INFO", color=3)         # Зелёный — информация
+    doc.layers.add("EXISTING_BUILDINGS", color=8)   # Серый — существующие здания
+    doc.layers.add("ROADS", color=42)               # Жёлтый — дороги
+    doc.layers.add("CADASTRAL", color=94)           # Зелёный — кадастр
+    doc.layers.add("INTERNAL_ROADS", color=252)     # Светло-серый — проезды
+    doc.layers.add("MASSING_SHADOWS", color=170)    # Синий — тени
 
     # Рисуем границу участка в оригинальных единицах
     site_coords = site_data.get("coordinates_original", site_data["coordinates"])
@@ -1149,6 +1206,46 @@ def write_massing_to_dxf(massing: dict, site_data: dict, output_path: str):
         dxfattribs={"layer": "SITE_BOUNDARY"},
         close=True,
     )
+
+    # Существующие здания
+    for eb in site_data.get("existing_buildings", []):
+        coords = list(eb["polygon"].exterior.coords)
+        msp.add_lwpolyline(
+            [(c[0] * inv_scale, c[1] * inv_scale) for c in coords],
+            dxfattribs={"layer": "EXISTING_BUILDINGS"},
+            close=True,
+        )
+
+    # Дороги
+    for road in site_data.get("roads", []):
+        if road.geom_type == 'Polygon':
+            coords = list(road.exterior.coords)
+            msp.add_lwpolyline(
+                [(c[0] * inv_scale, c[1] * inv_scale) for c in coords],
+                dxfattribs={"layer": "ROADS"},
+                close=True,
+            )
+
+    # Кадастровые участки
+    for parcel in site_data.get("parcels", []):
+        coords = list(parcel["polygon"].exterior.coords)
+        msp.add_lwpolyline(
+            [(c[0] * inv_scale, c[1] * inv_scale) for c in coords],
+            dxfattribs={"layer": "CADASTRAL"},
+            close=True,
+        )
+
+    # Внутренние проезды
+    for iroad in site_data.get("internal_roads", []):
+        road_poly = iroad["polygon"]
+        polys = [road_poly] if road_poly.geom_type == 'Polygon' else list(road_poly.geoms)
+        for rp in polys:
+            coords = list(rp.exterior.coords)
+            msp.add_lwpolyline(
+                [(c[0] * inv_scale, c[1] * inv_scale) for c in coords],
+                dxfattribs={"layer": "INTERNAL_ROADS"},
+                close=True,
+            )
 
     # Рисуем здания (AI генерирует в метрах, конвертируем обратно)
     for b in massing.get("buildings", []):
@@ -1190,6 +1287,9 @@ def write_massing_to_dxf(massing: dict, site_data: dict, output_path: str):
         f"Продаваемая площадь: {summary.get('total_sellable_area', '?')} м²",
         f"Плотность: {summary.get('density', '?')}",
         f"Покрытие: {summary.get('site_coverage_ratio', '?')}",
+        f"Квартиры: ~{summary.get('est_apartments', '?')} (ср. 55 м²)",
+        f"Паркинг: ~{summary.get('est_parking_spots', '?')} м/м",
+        f"Жители: ~{summary.get('est_residents', '?')} чел.",
     ]
 
     for i, line in enumerate(info_lines):
@@ -1255,6 +1355,20 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None, c
             ax.fill(rx, ry, facecolor='wheat', edgecolor='tan', linewidth=0.5, alpha=0.4)
     if site_data.get("roads"):
         ax.plot([], [], color='wheat', linewidth=5, alpha=0.5, label=f'Дороги ({len(site_data["roads"])})')
+
+    # Внутренние проезды (светло-серые)
+    for iroad in site_data.get("internal_roads", []):
+        road_poly = iroad["polygon"]
+        if road_poly.geom_type == 'Polygon':
+            irx, iry = road_poly.exterior.xy
+            ax.fill(irx, iry, facecolor='lightgray', edgecolor='gray', linewidth=0.5, alpha=0.5)
+        elif road_poly.geom_type == 'MultiPolygon':
+            for g in road_poly.geoms:
+                irx, iry = g.exterior.xy
+                ax.fill(irx, iry, facecolor='lightgray', edgecolor='gray', linewidth=0.5, alpha=0.5)
+    if site_data.get("internal_roads"):
+        ax.plot([], [], color='lightgray', linewidth=5, alpha=0.6,
+                label=f'Проезды ({len(site_data["internal_roads"])})')
 
     # Тени от зданий (полдень, 22 марта)
     latitude = config.get("site", {}).get("latitude", 54.6) if config else 54.6
@@ -1400,6 +1514,12 @@ def main():
         print("\nГенерация кварталов...")
         blocks = generate_courtyard_blocks(site_data, config)
 
+        # Внутренние проезды между кварталами
+        internal_roads = generate_internal_roads(blocks, site_data)
+        if internal_roads:
+            print(f"  Внутренние проезды: {len(internal_roads)}")
+            site_data["internal_roads"] = internal_roads
+
         # Генерируем infill-слоты в пустых зонах между кварталами
         slots = None
         infill = None
@@ -1496,7 +1616,7 @@ def main():
             print("  Инсоляция: OK")
 
         # Визуализация
-        viz_path = input_path.parent / "test_output" / "massing_v5.png"
+        viz_path = input_path.parent / "test_output" / "massing_latest.png"
         viz_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             visualize_massing(massing, site_data, str(viz_path), config=config)
