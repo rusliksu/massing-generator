@@ -463,7 +463,7 @@ def build_prompt(site_data: dict, config: dict, slots: list[dict] = None,
 {blocks_text}{infill_text}
 
 ## Ограничения
-- Макс. плотность: {constraints.get('max_density', 2.5)} | Целевая площадь: {constraints.get('target_area', 250000)} м²
+- Макс. плотность: {constraints.get('max_density', 2.5)} | Целевая площадь: {constraints.get('target_area', 45000)} м²
 - Этажность: 9-{constraints.get('max_floors', 25)} | Высота этажа: {constraints.get('min_floor_height', 3.0)} м
 - Sellable ≈ 75-80% от gross
 
@@ -623,6 +623,190 @@ def generate_massing(prompt: str, api_key: str = None, base_url: str = None) -> 
         if match:
             return json.loads(match.group())
         raise ValueError(f"Не удалось распарсить JSON из ответа AI:\n{text}")
+
+
+def compute_sun_position(latitude: float, hour: float, day_of_year: int = 81) -> tuple[float, float]:
+    """
+    Вычисляет азимут и высоту солнца.
+    day_of_year=81 → 22 марта (равноденствие, нормативная дата для инсоляции).
+    Возвращает (azimuth_deg, altitude_deg). Азимут от юга по часовой.
+    """
+    import math
+
+    # Склонение солнца (формула Купера)
+    declination = 23.45 * math.sin(math.radians(360 / 365 * (284 + day_of_year)))
+    decl_rad = math.radians(declination)
+    lat_rad = math.radians(latitude)
+
+    # Часовой угол (15° на час от солнечного полудня ~12:30 для Москвы)
+    hour_angle = (hour - 12.5) * 15
+    ha_rad = math.radians(hour_angle)
+
+    # Высота солнца
+    sin_alt = (math.sin(lat_rad) * math.sin(decl_rad) +
+               math.cos(lat_rad) * math.cos(decl_rad) * math.cos(ha_rad))
+    altitude = math.degrees(math.asin(max(-1, min(1, sin_alt))))
+
+    # Азимут (от юга, по часовой = положительный на запад)
+    cos_az = ((math.sin(decl_rad) - math.sin(lat_rad) * sin_alt) /
+              (math.cos(lat_rad) * math.cos(math.radians(altitude)) + 1e-10))
+    azimuth = math.degrees(math.acos(max(-1, min(1, cos_az))))
+    if hour_angle > 0:
+        azimuth = -azimuth  # после полудня — на запад (отрицательный = восточнее юга)
+
+    # Конвертируем в "от севера по часовой" (стандартный азимут)
+    azimuth_from_north = 180 + azimuth
+
+    return azimuth_from_north, altitude
+
+
+def compute_shadow_polygon(footprint: list, height: float,
+                           sun_azimuth: float, sun_altitude: float) -> Polygon:
+    """
+    Вычисляет полигон тени от здания.
+    footprint: [[x,y], ...] — координаты основания
+    height: высота здания в метрах
+    sun_azimuth: азимут солнца (от севера, по часовой)
+    sun_altitude: высота солнца в градусах
+    """
+    import math
+
+    if sun_altitude <= 0:
+        return Polygon()  # солнце за горизонтом
+
+    # Длина тени
+    shadow_length = height / math.tan(math.radians(sun_altitude))
+
+    # Направление тени (противоположно солнцу)
+    shadow_dir = math.radians(sun_azimuth + 180)
+    dx = shadow_length * math.sin(shadow_dir)
+    dy = shadow_length * math.cos(shadow_dir)
+
+    # Полигон тени = объединение footprint и сдвинутого footprint
+    base = Polygon(footprint)
+    shifted_pts = [(p[0] + dx, p[1] + dy) for p in footprint]
+    shifted = Polygon(shifted_pts)
+
+    shadow = unary_union([base, shifted]).convex_hull
+    return shadow
+
+
+def check_insolation(massing: dict, config: dict) -> list[dict]:
+    """
+    Проверяет инсоляцию: для каждого здания считает часы прямого солнца.
+    Возвращает список зданий с нарушениями (< min_hours).
+
+    Метод: каждые 30 мин с 7:00 до 17:00 на 22 марта считаем тень от всех зданий.
+    Если центроид фасада затенён — этот интервал не считается.
+    """
+    latitude = config.get("site", {}).get("latitude", 55.75)
+    min_hours = config.get("insolation", {}).get("min_hours", 2.0)
+    buildings = massing.get("buildings", [])
+
+    if not buildings:
+        return []
+
+    # Точки проверки: 7:00-17:00, шаг 30 мин = 20 интервалов
+    time_slots = [7.0 + i * 0.5 for i in range(21)]  # 7.0, 7.5, ... 17.0
+    step_hours = 0.5
+
+    # Предвычисляем позицию солнца для каждого слота
+    sun_positions = []
+    for t in time_slots:
+        az, alt = compute_sun_position(latitude, t)
+        if alt > 2:  # солнце выше 2° (практический порог)
+            sun_positions.append((t, az, alt))
+
+    # Для каждого здания строим полигон и высоту
+    building_data = []
+    for b in buildings:
+        fp = b["footprint"]
+        height = b.get("total_height", b.get("floors", 15) * b.get("floor_height", 3.0))
+        poly = Polygon(fp)
+        building_data.append({"building": b, "polygon": poly, "height": height,
+                              "footprint": fp})
+
+    # Для каждого здания считаем часы солнца
+    violations = []
+    for i, bd in enumerate(building_data):
+        target = bd["polygon"]
+        target_centroid = target.centroid
+        sun_hours = 0
+        max_continuous = 0
+        current_continuous = 0
+
+        for t, az, alt in sun_positions:
+            shaded = False
+            # Проверяем тень от каждого ДРУГОГО здания
+            for j, other in enumerate(building_data):
+                if i == j:
+                    continue
+                shadow = compute_shadow_polygon(other["footprint"], other["height"], az, alt)
+                if shadow.is_valid and shadow.contains(target_centroid):
+                    shaded = True
+                    break
+
+            if not shaded:
+                sun_hours += step_hours
+                current_continuous += step_hours
+                max_continuous = max(max_continuous, current_continuous)
+            else:
+                current_continuous = 0
+
+        bd["building"]["sun_hours"] = round(sun_hours, 1)
+        bd["building"]["max_continuous_sun"] = round(max_continuous, 1)
+
+        if max_continuous < min_hours:
+            violations.append({
+                "building_id": bd["building"]["id"],
+                "floors": bd["building"].get("floors", "?"),
+                "sun_hours_total": round(sun_hours, 1),
+                "max_continuous": round(max_continuous, 1),
+                "required": min_hours,
+            })
+
+    return violations
+
+
+def fix_insolation_violations(massing: dict, violations: list[dict], config: dict):
+    """Снижает этажность зданий-нарушителей до устранения затенения."""
+    if not violations:
+        return
+
+    violation_ids = {v["building_id"] for v in violations}
+    buildings = massing.get("buildings", [])
+
+    # Для нарушителей — пробуем снизить соседей на 2-3 этажа
+    # Упрощённый подход: снижаем самые высокие здания рядом с нарушителями
+    for v in violations:
+        target = next((b for b in buildings if b["id"] == v["building_id"]), None)
+        if not target:
+            continue
+        target_poly = Polygon(target["footprint"])
+
+        # Находим ближайшие высокие здания
+        neighbors = []
+        for b in buildings:
+            if b["id"] == v["building_id"]:
+                continue
+            bp = Polygon(b["footprint"])
+            dist = target_poly.distance(bp)
+            if dist < 100:  # в радиусе 100м
+                neighbors.append((b, dist))
+
+        neighbors.sort(key=lambda x: x[0].get("floors", 0), reverse=True)
+
+        # Снижаем этажность самого высокого соседа на 3
+        for nb, dist in neighbors[:2]:
+            old_floors = nb.get("floors", 15)
+            new_floors = max(9, old_floors - 3)
+            if new_floors < old_floors:
+                nb["floors"] = new_floors
+                nb["total_height"] = new_floors * nb.get("floor_height", 3.0)
+                nb["gross_area"] = round(Polygon(nb["footprint"]).area * new_floors)
+                nb["sellable_area"] = round(nb["gross_area"] * 0.78)
+                print(f"    Здание {nb['id']}: {old_floors}→{new_floors} эт. "
+                      f"(затеняет здание {v['building_id']})")
 
 
 def _inject_block_ids(massing: dict, blocks: list[dict]):
@@ -900,11 +1084,19 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None):
         ax.add_patch(plt.Polygon(fp, closed=True, facecolor=color, edgecolor='black',
                                   linewidth=1.5, alpha=0.7))
 
-        # Подпись этажности
+        # Подпись этажности + инсоляция
         centroid = Polygon(fp).centroid
         floors = b.get("floors", "?")
-        ax.text(centroid.x, centroid.y, f"{floors}эт", ha='center', va='center',
-                fontsize=7, fontweight='bold')
+        sun_h = b.get("max_continuous_sun")
+        label = f"{floors}эт"
+        if sun_h is not None:
+            label += f"\n{sun_h}ч"
+            if sun_h < 2.0:
+                # Красная обводка для нарушений инсоляции
+                ax.add_patch(plt.Polygon(fp, closed=True, facecolor='none',
+                                          edgecolor='red', linewidth=3, alpha=0.8))
+        ax.text(centroid.x, centroid.y, label, ha='center', va='center',
+                fontsize=6, fontweight='bold')
 
     ax.set_aspect('equal')
     ax.set_title(f"Массинг v5 — {massing.get('summary', {}).get('total_buildings', '?')} зданий, "
@@ -1034,6 +1226,32 @@ def main():
         summary = massing.get("summary", {})
         print(f"  Финальный результат: {summary.get('total_buildings', 0)} зданий, "
               f"{summary.get('total_sellable_area', 0)} м² продаваемой площади")
+
+        # Проверка инсоляции
+        print("\nПроверка инсоляции (22 марта, СанПиН)...")
+        insol_violations = check_insolation(massing, config)
+        if insol_violations:
+            print(f"  Нарушения инсоляции: {len(insol_violations)} зданий")
+            for v in insol_violations:
+                print(f"    Здание {v['building_id']} ({v['floors']}эт): "
+                      f"макс. непрерывно {v['max_continuous']}ч (нужно {v['required']}ч)")
+            print("  Корректировка этажности...")
+            fix_insolation_violations(massing, insol_violations, config)
+            # Пересчёт summary
+            buildings = massing.get("buildings", [])
+            total_gross = sum(b.get("gross_area", 0) for b in buildings)
+            total_sell = sum(b.get("sellable_area", 0) for b in buildings)
+            massing["summary"]["total_gross_area"] = total_gross
+            massing["summary"]["total_sellable_area"] = total_sell
+            massing["summary"]["density"] = round(total_gross / site_data["area_m2"], 2)
+            # Повторная проверка
+            insol_v2 = check_insolation(massing, config)
+            if insol_v2:
+                print(f"  После корректировки: ещё {len(insol_v2)} нарушений (допустимо для MVP)")
+            else:
+                print("  Инсоляция: OK после корректировки")
+        else:
+            print("  Инсоляция: OK")
 
         # Визуализация
         viz_path = input_path.parent / "test_output" / "massing_v5.png"
