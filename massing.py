@@ -173,6 +173,113 @@ def _make_u_shape(cx, cy, total_w, total_h, depth, gap):
     ])
 
 
+def generate_courtyard_blocks(site_data: dict, config: dict) -> list[dict]:
+    """
+    Генерирует квартальные блоки (двор + 3-5 секций вокруг).
+    Варьирует размеры: 70-110м блок, разная глубина крыльев.
+    Реалистичная квартальная застройка с Г-образными и П-образными вариациями.
+    """
+    import numpy as np
+    from shapely.geometry import box
+    from shapely.affinity import rotate
+    import random
+
+    random.seed(42)  # воспроизводимость
+
+    buildable_info = compute_buildable_area(site_data, config)
+    buildable = buildable_info["polygon"]
+    bounds = buildable.bounds
+
+    # Определяем угол участка
+    mrr = buildable.minimum_rotated_rectangle
+    mrr_coords = list(mrr.exterior.coords)
+    edge1 = np.array(mrr_coords[1]) - np.array(mrr_coords[0])
+    edge2 = np.array(mrr_coords[2]) - np.array(mrr_coords[1])
+    if np.linalg.norm(edge1) > np.linalg.norm(edge2):
+        main_angle = np.degrees(np.arctan2(edge1[1], edge1[0]))
+    else:
+        main_angle = np.degrees(np.arctan2(edge2[1], edge2[0]))
+
+    # Шаблоны кварталов разного размера (компактнее для плотной застройки)
+    block_templates = [
+        {"w": 85, "h": 70, "depth": 15, "name": "wide"},
+        {"w": 70, "h": 85, "depth": 15, "name": "tall"},
+        {"w": 75, "h": 75, "depth": 16, "name": "square"},
+        {"w": 90, "h": 65, "depth": 14, "name": "long"},
+    ]
+
+    max_block = max(max(t["w"], t["h"]) for t in block_templates)
+    # Учитываем вращение: повёрнутые здания выступают за номинальные границы
+    rotation_margin = max_block * abs(np.sin(np.radians(main_angle))) * 0.5
+    grid_step = max_block + 18 + rotation_margin  # квартал + проезд + поправка на вращение
+
+    x_range = np.arange(bounds[0] + 50, bounds[2] - 50, grid_step)
+    y_range = np.arange(bounds[1] + 50, bounds[3] - 50, grid_step)
+
+    blocks = []
+    block_id = 1
+
+    for ix, cx in enumerate(x_range):
+        for iy, cy in enumerate(y_range):
+            # Чередуем шаблоны для разнообразия
+            tmpl = block_templates[(ix + iy) % len(block_templates)]
+            hw, hh = tmpl["w"] / 2, tmpl["h"] / 2
+            d = tmpl["depth"]
+
+            buildings_in_block = []
+
+            # Верхняя секция (длинная, вся ширина блока)
+            top = box(cx - hw, cy + hh - d, cx + hw, cy + hh)
+            # Нижняя секция (может быть короче, но в пределах блока)
+            bot_shrink = random.choice([0, 0.15, 0.25])
+            bottom = box(cx - hw * (1 - bot_shrink), cy - hh,
+                         cx + hw * (1 - bot_shrink), cy - hh + d)
+            # Левая секция (боковая)
+            left = box(cx - hw, cy - hh + d, cx - hw + d, cy + hh - d)
+            # Правая секция (боковая, может отсутствовать → открытый квартал)
+            right = box(cx + hw - d, cy - hh + d, cx + hw, cy + hh - d)
+
+            # Некоторые кварталы — открытые (без одной стороны)
+            sections = [("top", top), ("bottom", bottom), ("left", left)]
+            if random.random() > 0.3:  # 70% — закрытые кварталы
+                sections.append(("right", right))
+
+            for label, shape in sections:
+                rotated = rotate(shape, main_angle, origin=(cx, cy))
+                # Более мягкая проверка: 90% площади внутри (краевые здания)
+                if buildable.contains(rotated) or (
+                    buildable.intersection(rotated).area / rotated.area >= 0.85
+                ):
+                    # Клиппим к buildable если не полностью внутри
+                    if not buildable.contains(rotated):
+                        clipped = buildable.intersection(rotated)
+                        if clipped.geom_type == 'Polygon' and clipped.area > rotated.area * 0.5:
+                            rotated = clipped
+                        else:
+                            continue
+                    fp = list(rotated.exterior.coords)[:-1]
+                    buildings_in_block.append({
+                        "position": label,
+                        "footprint": [[round(p[0], 1), round(p[1], 1)] for p in fp],
+                        "area_m2": round(rotated.area, 0),
+                        "orientation_deg": round(main_angle, 1),
+                    })
+
+            # Квартал валиден если хотя бы 2 здания внутри
+            if len(buildings_in_block) >= 2:
+                blocks.append({
+                    "block_id": block_id,
+                    "center": [round(cx, 1), round(cy, 1)],
+                    "buildings": buildings_in_block,
+                    "building_count": len(buildings_in_block),
+                    "template": tmpl["name"],
+                })
+                block_id += 1
+
+    print(f"  Сгенерировано {len(blocks)} кварталов ({sum(b['building_count'] for b in blocks)} зданий)")
+    return blocks
+
+
 def generate_building_slots(site_data: dict, config: dict) -> list[dict]:
     """
     Генерирует сетку допустимых позиций для зданий внутри buildable polygon.
@@ -241,7 +348,89 @@ def generate_building_slots(site_data: dict, config: dict) -> list[dict]:
     return slots
 
 
-def build_prompt(site_data: dict, config: dict, slots: list[dict] = None) -> str:
+def generate_infill_buildings(site_data: dict, config: dict, blocks: list[dict]) -> list[dict]:
+    """Генерирует отдельные здания в пустых зонах между кварталами."""
+    import numpy as np
+    from shapely.geometry import box, Point
+    from shapely.affinity import rotate
+
+    buildable_info = compute_buildable_area(site_data, config)
+    buildable = buildable_info["polygon"]
+    fire_dist = config.get("fire_safety", {}).get("min_distance", 12)
+
+    # Собираем все полигоны зданий кварталов
+    block_polys = []
+    for bl in blocks:
+        for b in bl["buildings"]:
+            block_polys.append(Polygon(b["footprint"]))
+
+    # Определяем угол
+    mrr = buildable.minimum_rotated_rectangle
+    mrr_coords = list(mrr.exterior.coords)
+    edge1 = np.array(mrr_coords[1]) - np.array(mrr_coords[0])
+    edge2 = np.array(mrr_coords[2]) - np.array(mrr_coords[1])
+    if np.linalg.norm(edge1) > np.linalg.norm(edge2):
+        main_angle = np.degrees(np.arctan2(edge1[1], edge1[0]))
+    else:
+        main_angle = np.degrees(np.arctan2(edge2[1], edge2[0]))
+
+    bounds = buildable.bounds
+    infill = []
+    infill_id = 1000  # чтобы не конфликтовать с block buildings
+
+    # Шаблоны infill-зданий (меньше чем квартальные)
+    templates = [
+        ("60x16 секционный", lambda cx, cy: box(cx-30, cy-8, cx+30, cy+8)),
+        ("45x16 секционный", lambda cx, cy: box(cx-22.5, cy-8, cx+22.5, cy+8)),
+        ("24x24 башня", lambda cx, cy: box(cx-12, cy-12, cx+12, cy+12)),
+    ]
+
+    grid_step = 40  # плотная сетка для infill
+    x_range = np.arange(bounds[0] + 30, bounds[2] - 30, grid_step)
+    y_range = np.arange(bounds[1] + 30, bounds[3] - 30, grid_step)
+
+    for cx in x_range:
+        for cy in y_range:
+            # Проверяем что точка далеко от всех блочных зданий
+            pt = Point(cx, cy)
+            too_close = False
+            for bp in block_polys:
+                if pt.distance(bp) < fire_dist + 30:  # 30м буфер от кварталов
+                    too_close = True
+                    break
+            if too_close:
+                continue
+
+            # Пробуем разные шаблоны
+            for desc, gen in templates:
+                shape = gen(cx, cy)
+                rotated = rotate(shape, main_angle, origin='centroid')
+                if buildable.contains(rotated):
+                    # Проверяем fire distance до всех существующих infill
+                    ok = True
+                    for existing in infill:
+                        ep = Polygon(existing["footprint"])
+                        if rotated.distance(ep) < fire_dist:
+                            ok = False
+                            break
+                    if ok:
+                        fp = list(rotated.exterior.coords)[:-1]
+                        infill.append({
+                            "infill_id": infill_id,
+                            "center": [round(cx, 1), round(cy, 1)],
+                            "size": desc,
+                            "footprint": [[round(p[0], 1), round(p[1], 1)] for p in fp],
+                            "area_m2": round(rotated.area, 0),
+                            "orientation_deg": round(main_angle, 1),
+                        })
+                        infill_id += 1
+                        break  # один шаблон на позицию
+
+    return infill
+
+
+def build_prompt(site_data: dict, config: dict, slots: list[dict] = None,
+                 blocks: list[dict] = None, infill: list[dict] = None) -> str:
     """Формирование промпта для AI."""
     constraints = config.get("constraints", {})
     fire = config.get("fire_safety", {})
@@ -250,6 +439,70 @@ def build_prompt(site_data: dict, config: dict, slots: list[dict] = None) -> str
     latitude = config.get("site", {}).get("latitude", 55.75)
 
     buildable = compute_buildable_area(site_data, config)
+
+    # Режим кварталов
+    if blocks:
+        blocks_text = ""
+        for bl in blocks:
+            blocks_text += f"\nКвартал {bl['block_id']} (центр {bl['center']}, {bl['building_count']} зданий):\n"
+            for b in bl["buildings"]:
+                blocks_text += f"  - {b['position']}: {b['area_m2']}м², footprint={json.dumps(b['footprint'])}\n"
+
+        infill_text = ""
+        if infill:
+            infill_text = "\n\n## Отдельные здания (infill, в пустых зонах между кварталами):\n"
+            for inf in infill:
+                infill_text += f"  - infill_{inf['infill_id']}: {inf['size']}, {inf['area_m2']}м², footprint={json.dumps(inf['footprint'])}\n"
+
+        return f"""Ты — архитектор-градостроитель. Назначь этажность зданиям в готовых кварталах и отдельным зданиям.
+
+## Участок
+- Площадь: {site_data['area_m2']} м² | Зона застройки: {buildable['area_m2']} м²
+
+## Готовые кварталы (здания уже размещены, все внутри зоны):
+{blocks_text}{infill_text}
+
+## Ограничения
+- Макс. плотность: {constraints.get('max_density', 2.5)} | Целевая площадь: {constraints.get('target_area', 250000)} м²
+- Этажность: 9-{constraints.get('max_floors', 25)} | Высота этажа: {constraints.get('min_floor_height', 3.0)} м
+- Sellable ≈ 75-80% от gross
+
+## Задача
+Для КАЖДОГО здания (квартальных и infill) назначь этажность.
+- Квартальные верхние/нижние (длинные) секции: 14-25 этажей
+- Квартальные боковые (короткие) секции: 9-17 этажей (ниже длинных, для инсоляции двора)
+- Infill-здания: 12-20 этажей (секционные), 20-25 этажей (башни)
+- Выше в центре участка, ниже по краям
+- Варьируй этажность
+- ОБЯЗАТЕЛЬНО сохрани block_id для квартальных зданий. Для infill — block_id: null
+- ВКЛЮЧИ ВСЕ infill-здания в ответ
+
+## Формат: ТОЛЬКО JSON
+{{
+  "buildings": [
+    {{
+      "id": 1,
+      "block_id": 1,
+      "position": "top",
+      "type": "residential",
+      "footprint": [[x,y],...],
+      "floors": 17,
+      "floor_height": 3.0,
+      "total_height": 51.0,
+      "gross_area": 24480,
+      "sellable_area": 19584,
+      "orientation_deg": 15
+    }}
+  ],
+  "summary": {{
+    "total_buildings": 25,
+    "total_gross_area": 400000,
+    "total_sellable_area": 320000,
+    "density": 2.3,
+    "site_coverage_ratio": 0.30,
+    "notes": "описание"
+  }}
+}}"""
 
     # Если есть слоты — режим выбора из готовых позиций
     if slots:
@@ -372,6 +625,41 @@ def generate_massing(prompt: str, api_key: str = None, base_url: str = None) -> 
         raise ValueError(f"Не удалось распарсить JSON из ответа AI:\n{text}")
 
 
+def _inject_block_ids(massing: dict, blocks: list[dict]):
+    """Сопоставляет здания из AI-ответа с блоками по центру блока."""
+    from shapely.geometry import Point
+
+    # Для каждого блока — центр и радиус
+    block_centers = []
+    for bl in blocks:
+        cx, cy = bl["center"]
+        block_centers.append((bl["block_id"], Point(cx, cy)))
+
+    matched = 0
+    for building in massing.get("buildings", []):
+        # Если AI уже вернул block_id — проверяем что он валидный
+        existing = building.get("block_id")
+        if existing and any(bc[0] == existing for bc in block_centers):
+            matched += 1
+            continue
+
+        bp = Polygon(building["footprint"])
+        centroid = bp.centroid
+        best_dist = float("inf")
+        best_block = None
+        for block_id, center in block_centers:
+            d = centroid.distance(center)
+            if d < best_dist:
+                best_dist = d
+                best_block = block_id
+        # Привязываем если центроид здания в пределах 70м от центра блока
+        if best_block is not None and best_dist < 70:
+            building["block_id"] = best_block
+            matched += 1
+
+    print(f"  Block ID injection: {matched}/{len(massing.get('buildings', []))} зданий привязаны к кварталам")
+
+
 def clip_massing_to_buildable(massing: dict, site_data: dict, config: dict) -> dict:
     """Удаляет здания с overlap <50% и пересекающиеся здания."""
     buildable_info = compute_buildable_area(site_data, config)
@@ -396,11 +684,18 @@ def clip_massing_to_buildable(massing: dict, site_data: dict, config: dict) -> d
         print(f"    Удалено вне зоны: {removed}")
 
     # Шаг 2: убрать пересекающиеся (оставляем здание с большей площадью)
+    # Здания внутри одного квартала (block_id) освобождены от fire distance
     kept = []
     for b in valid_buildings:
         fp = Polygon(b["footprint"])
         conflict = False
         for k in kept:
+            # Пропускаем проверку для зданий одного квартала
+            b_block = b.get("block_id")
+            k_block = k.get("block_id")
+            if b_block is not None and k_block is not None and b_block == k_block:
+                continue
+
             kfp = Polygon(k["footprint"])
             if fp.distance(kfp) < fire_dist:
                 # Конфликт — оставляем большее
@@ -463,14 +758,22 @@ def validate_massing(massing: dict, site_data: dict, config: dict, overlap_thres
         if b.get("floors", 0) > max_floors:
             errors.append(f"Здание {b['id']}: этажность {b['floors']} > макс. {max_floors}")
 
-    # Проверка противопожарных разрывов
+    # Проверка противопожарных разрывов (внутри одного квартала — пропуск)
     min_dist = fire.get("min_distance", 12)
+    buildings_list = massing.get("buildings", [])
     for i in range(len(buildings_polygons)):
         for j in range(i + 1, len(buildings_polygons)):
+            # Здания одного квартала — fire distance не проверяем
+            bi_block = buildings_list[i].get("block_id") if i < len(buildings_list) else None
+            bj_block = buildings_list[j].get("block_id") if j < len(buildings_list) else None
+            if bi_block is not None and bj_block is not None and bi_block == bj_block:
+                continue
+
             dist = buildings_polygons[i].distance(buildings_polygons[j])
             if dist < min_dist:
                 errors.append(
-                    f"Здания {i+1} и {j+1}: расстояние {dist:.1f}м < мин. {min_dist}м"
+                    f"Здания {i+1} и {j+1}: расстояние {dist:.1f}м < мин. {min_dist}м "
+                    f"(blocks: {bi_block} vs {bj_block})"
                 )
 
     # Проверка плотности
@@ -559,6 +862,63 @@ def write_massing_to_dxf(massing: dict, site_data: dict, output_path: str):
     print(f"DXF сохранён: {output_path}")
 
 
+def visualize_massing(massing: dict, site_data: dict, output_path: str = None):
+    """Визуализация массинга через matplotlib."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from matplotlib.collections import PatchCollection
+
+    fig, ax = plt.subplots(1, 1, figsize=(14, 14))
+
+    # Граница участка
+    site_poly = Polygon(site_data["coordinates"])
+    x, y = site_poly.exterior.xy
+    ax.plot(x, y, 'b-', linewidth=2, label='Граница участка')
+
+    # Buildable area
+    from shapely.geometry import Polygon as ShapelyPolygon
+    setback = 6
+    buildable = site_poly.buffer(-setback)
+    if buildable.geom_type == 'Polygon':
+        bx, by = buildable.exterior.xy
+        ax.plot(bx, by, 'g--', linewidth=1, alpha=0.5, label='Зона застройки')
+
+    # Здания
+    colors_by_block = {}
+    cmap = plt.cm.Set3
+    building_patches = []
+    for b in massing.get("buildings", []):
+        fp = b["footprint"]
+        poly = plt.Polygon(fp, closed=True)
+        block_id = b.get("block_id", 0)
+        if block_id not in colors_by_block:
+            colors_by_block[block_id] = cmap(len(colors_by_block) % 12)
+        color = colors_by_block[block_id]
+
+        ax.add_patch(plt.Polygon(fp, closed=True, facecolor=color, edgecolor='black',
+                                  linewidth=1.5, alpha=0.7))
+
+        # Подпись этажности
+        centroid = Polygon(fp).centroid
+        floors = b.get("floors", "?")
+        ax.text(centroid.x, centroid.y, f"{floors}эт", ha='center', va='center',
+                fontsize=7, fontweight='bold')
+
+    ax.set_aspect('equal')
+    ax.set_title(f"Массинг v5 — {massing.get('summary', {}).get('total_buildings', '?')} зданий, "
+                 f"{massing.get('summary', {}).get('total_sellable_area', '?')} м²",
+                 fontsize=14)
+    ax.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
+
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Визуализация: {output_path}")
+    plt.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="AI Massing Generator")
     parser.add_argument("--input", "-i", required=True, help="DWG/DXF файл с пятном застройки")
@@ -614,15 +974,29 @@ def main():
         print(f"  Размеры: {site_data['width']} x {site_data['height']} м")
         print(f"  Найдено полигонов: {site_data['all_polygons_count']}")
 
-        # Генерация слотов для зданий
-        print("\nГенерация слотов...")
-        slots = generate_building_slots(site_data, config)
+        # Генерация кварталов
+        print("\nГенерация кварталов...")
+        blocks = generate_courtyard_blocks(site_data, config)
+
+        # Генерируем infill-слоты в пустых зонах между кварталами
+        slots = None
+        infill = None
+        if len(blocks) < 3:
+            print("  Мало кварталов, переключаюсь на слоты...")
+            slots = generate_building_slots(site_data, config)
+        else:
+            # Добавляем infill — отдельные здания в пустых зонах
+            infill = generate_infill_buildings(site_data, config, blocks)
+            if infill:
+                print(f"  + {len(infill)} infill-зданий в пустых зонах")
 
         # Генерация массинга
         prev_errors = []
         for attempt in range(1, args.max_retries + 1):
             print(f"\nГенерация массинга (попытка {attempt}/{args.max_retries})...")
-            prompt = build_prompt(site_data, config, slots=slots if slots else None)
+            prompt = build_prompt(site_data, config, slots=slots,
+                                 blocks=blocks if not slots else None,
+                                 infill=infill if not slots else None)
             if prev_errors:
                 prompt += "\n\n## ОШИБКИ ПРЕДЫДУЩЕЙ ПОПЫТКИ (исправь их!)\n"
                 for err in prev_errors:
@@ -634,6 +1008,10 @@ def main():
             print(f"  Зданий: {summary.get('total_buildings', '?')}")
             print(f"  Продаваемая площадь: {summary.get('total_sellable_area', '?')} м²")
             print(f"  Плотность: {summary.get('density', '?')}")
+
+            # Инъекция block_id: сопоставляем здания с блоками по proximity
+            if blocks and not slots:
+                _inject_block_ids(massing, blocks)
 
             # Валидация
             errors = validate_massing(massing, site_data, config)
@@ -656,6 +1034,14 @@ def main():
         summary = massing.get("summary", {})
         print(f"  Финальный результат: {summary.get('total_buildings', 0)} зданий, "
               f"{summary.get('total_sellable_area', 0)} м² продаваемой площади")
+
+        # Визуализация
+        viz_path = input_path.parent / "test_output" / "massing_v5.png"
+        viz_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            visualize_massing(massing, site_data, str(viz_path))
+        except Exception as e:
+            print(f"  Визуализация не удалась: {e}")
 
         # Запись результата в DXF
         output_dxf = Path(tmpdir) / f"{input_path.stem}_massing.dxf"
