@@ -125,14 +125,139 @@ def parse_site_boundary(dxf_path: str, layer: str = None, scale: float = 1.0) ->
     }
 
 
-def compute_buildable_area(site_data: dict, config: dict) -> dict:
-    """Вычисляет зону застройки с учётом отступов."""
+def parse_existing_buildings(dxf_path: str, scale: float = 1.0) -> list[dict]:
+    """
+    Извлекает существующие здания из DXF.
+    Ищет замкнутые полилинии на слоях с маркерами зданий/этажей.
+    """
+    from shapely.affinity import scale as shapely_scale
+
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+
+    # Слои, содержащие существующие здания
+    building_layer_patterns = ["к1", "к2", "этаж", "инт13", "инт14"]
+    # Кадастровые слои: маленькие участки (<500 м²) — вероятно здания
+    cadastral_layer_patterns = ["p_"]
+
+    buildings = []
+    for entity in msp:
+        if entity.dxftype() != "LWPOLYLINE" or not entity.closed:
+            continue
+
+        layer = entity.dxf.layer.lower()
+        points = [(p[0], p[1]) for p in entity.get_points()]
+        if len(points) < 3:
+            continue
+
+        poly = Polygon(points)
+        if poly.area <= 0:
+            continue
+
+        poly_scaled = shapely_scale(poly, xfact=scale, yfact=scale, origin=(0, 0))
+        area = poly_scaled.area
+
+        # Прямое совпадение со слоями зданий
+        is_building = any(p in layer for p in building_layer_patterns)
+
+        # Маленькие кадастровые участки (<500 м²) — скорее всего существующие постройки
+        is_small_parcel = (any(layer.startswith(p) for p in cadastral_layer_patterns)
+                          and 50 < area < 500)
+
+        if (is_building and 50 < area < 50000) or is_small_parcel:
+            buildings.append({
+                "layer": entity.dxf.layer,
+                "polygon": poly_scaled,
+                "area_m2": round(area, 1),
+                "centroid": (round(poly_scaled.centroid.x, 1), round(poly_scaled.centroid.y, 1)),
+            })
+
+    return buildings
+
+
+def parse_roads(dxf_path: str, scale: float = 1.0) -> list[Polygon]:
+    """
+    Извлекает дороги из DXF (слой ГП Дорога и похожие).
+    Возвращает список полигонов дорог.
+    """
+    from shapely.affinity import scale as shapely_scale
+
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+
+    road_patterns = ["дорог", "road", "проезд", "улиц"]
+    roads = []
+
+    for entity in msp:
+        layer = entity.dxf.layer.lower()
+        is_road = any(p in layer for p in road_patterns)
+        if not is_road:
+            continue
+
+        if entity.dxftype() == "LWPOLYLINE":
+            points = [(p[0], p[1]) for p in entity.get_points()]
+            if len(points) < 2:
+                continue
+
+            from shapely.geometry import LineString
+            line = LineString(points)
+            line_scaled = shapely_scale(line, xfact=scale, yfact=scale, origin=(0, 0))
+
+            # Буферизуем линию в полигон дороги (ширина ~6м с каждой стороны)
+            road_poly = line_scaled.buffer(6)
+            if road_poly.area > 10:
+                roads.append(road_poly)
+
+        elif entity.dxftype() == "LWPOLYLINE" and entity.closed:
+            points = [(p[0], p[1]) for p in entity.get_points()]
+            if len(points) >= 3:
+                poly = Polygon(points)
+                poly_scaled = shapely_scale(poly, xfact=scale, yfact=scale, origin=(0, 0))
+                if poly_scaled.area > 10:
+                    roads.append(poly_scaled)
+
+    return roads
+
+
+def compute_buildable_area(site_data: dict, config: dict,
+                           existing_buildings: list = None,
+                           roads: list = None) -> dict:
+    """Вычисляет зону застройки с учётом отступов, существующих зданий и дорог."""
     site_polygon = Polygon(site_data["coordinates"])
     setback = config.get("setbacks", {}).get("default", 6)
+    road_setback = config.get("setbacks", {}).get("road", 10)
     buildable = site_polygon.buffer(-setback)
+
+    # Берём из site_data если не переданы явно
+    if existing_buildings is None:
+        existing_buildings = site_data.get("existing_buildings", [])
+    if roads is None:
+        roads = site_data.get("roads", [])
+
+    # Вырезаем существующие здания (с буфером 15м — пожарный разрыв)
+    if existing_buildings:
+        for eb in existing_buildings:
+            exclusion = eb["polygon"].buffer(15)
+            buildable = buildable.difference(exclusion)
+            if buildable.is_empty:
+                break
+
+    # Вырезаем дороги (с увеличенным отступом)
+    if roads:
+        for road in roads:
+            exclusion = road.buffer(road_setback)
+            buildable = buildable.difference(exclusion)
+            if buildable.is_empty:
+                break
+
+    # Если после вырезания осталось MultiPolygon — берём самый большой кусок
+    if buildable.geom_type == 'MultiPolygon':
+        buildable = max(buildable.geoms, key=lambda g: g.area)
 
     # Упрощаем для промпта (меньше вершин)
     simplified = buildable.simplify(2.0, preserve_topology=True)
+    if simplified.geom_type == 'MultiPolygon':
+        simplified = max(simplified.geoms, key=lambda g: g.area)
     coords = list(simplified.exterior.coords)
     bounds = simplified.bounds
 
@@ -1061,13 +1186,32 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None):
     x, y = site_poly.exterior.xy
     ax.plot(x, y, 'b-', linewidth=2, label='Граница участка')
 
-    # Buildable area
+    # Buildable area (с вырезами под существующие здания и дороги)
     from shapely.geometry import Polygon as ShapelyPolygon
-    setback = 6
-    buildable = site_poly.buffer(-setback)
+    buildable_info = compute_buildable_area(site_data, {"setbacks": {"default": 6, "road": 10}})
+    buildable = buildable_info["polygon"]
     if buildable.geom_type == 'Polygon':
         bx, by = buildable.exterior.xy
         ax.plot(bx, by, 'g--', linewidth=1, alpha=0.5, label='Зона застройки')
+    elif buildable.geom_type == 'MultiPolygon':
+        for geom in buildable.geoms:
+            bx, by = geom.exterior.xy
+            ax.plot(bx, by, 'g--', linewidth=1, alpha=0.5)
+
+    # Существующие здания (серые)
+    for eb in site_data.get("existing_buildings", []):
+        ex, ey = eb["polygon"].exterior.xy
+        ax.fill(ex, ey, facecolor='gray', edgecolor='darkgray', linewidth=1, alpha=0.5)
+    if site_data.get("existing_buildings"):
+        ax.plot([], [], color='gray', linewidth=5, alpha=0.5, label=f'Существующие ({len(site_data["existing_buildings"])})')
+
+    # Дороги (светло-коричневые)
+    for road in site_data.get("roads", []):
+        if road.geom_type == 'Polygon':
+            rx, ry = road.exterior.xy
+            ax.fill(rx, ry, facecolor='wheat', edgecolor='tan', linewidth=0.5, alpha=0.4)
+    if site_data.get("roads"):
+        ax.plot([], [], color='wheat', linewidth=5, alpha=0.5, label=f'Дороги ({len(site_data["roads"])})')
 
     # Здания
     colors_by_block = {}
@@ -1165,6 +1309,20 @@ def main():
         print(f"  Площадь участка: {site_data['area_m2']} м²")
         print(f"  Размеры: {site_data['width']} x {site_data['height']} м")
         print(f"  Найдено полигонов: {site_data['all_polygons_count']}")
+
+        # Парсинг существующих зданий и дорог
+        print("\nПарсинг контекста участка...")
+        existing_buildings = parse_existing_buildings(dxf_path, scale=args.scale)
+        roads = parse_roads(dxf_path, scale=args.scale)
+        print(f"  Существующие здания: {len(existing_buildings)}")
+        print(f"  Дороги: {len(roads)}")
+        if existing_buildings:
+            total_existing = sum(b["area_m2"] for b in existing_buildings)
+            print(f"  Общая площадь существующей застройки: {total_existing:.0f} м²")
+
+        # Сохраняем в site_data для доступа из других функций
+        site_data["existing_buildings"] = existing_buildings
+        site_data["roads"] = roads
 
         # Генерация кварталов
         print("\nГенерация кварталов...")
