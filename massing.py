@@ -344,7 +344,7 @@ def generate_courtyard_blocks(site_data: dict, config: dict) -> list[dict]:
     from shapely.affinity import rotate
     import random
 
-    random.seed(42)  # воспроизводимость
+    # seed задаётся снаружи (main) для поддержки --variants
 
     buildable_info = compute_buildable_area(site_data, config)
     buildable = buildable_info["polygon"]
@@ -868,20 +868,25 @@ def generate_massing(prompt: str, api_key: str = None, base_url: str = None) -> 
 
     client = Anthropic(**client_kwargs)
 
-    # Retry на connection errors (VPS прокси может дропнуть)
+    # Retry на connection/timeout errors (VPS прокси может дропнуть)
     import time as _time
-    for attempt in range(3):
+    max_api_retries = 5
+    for attempt in range(max_api_retries):
         try:
             response = client.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=8192,
+                timeout=120.0,
                 messages=[{"role": "user", "content": prompt}],
             )
             break
         except Exception as e:
-            if "Connection" in str(type(e).__name__) and attempt < 2:
-                print(f"  Ошибка соединения, повтор через 5с... ({e.__class__.__name__})")
-                _time.sleep(5)
+            err_name = type(e).__name__
+            is_retriable = any(k in err_name for k in ("Connection", "Timeout", "APIConnection", "APITimeout"))
+            if is_retriable and attempt < max_api_retries - 1:
+                delay = 10 * (attempt + 1)  # 10, 20, 30, 40с
+                print(f"  Ошибка соединения, повтор через {delay}с... ({err_name})")
+                _time.sleep(delay)
                 continue
             raise
 
@@ -1515,6 +1520,8 @@ def main():
     parser.add_argument("--layer", "-l", help="Слой DXF с пятном застройки")
     parser.add_argument("--scale", "-s", type=float, default=1.0,
                         help="Масштаб координат (0.001 для мм→м)")
+    parser.add_argument("--variants", "-v", type=int, default=1,
+                        help="Количество вариантов (1-5). Каждый с разным seed")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -1572,144 +1579,186 @@ def main():
         site_data["roads"] = roads
         site_data["parcels"] = parcels
 
-        # Генерация кварталов
-        print("\nГенерация кварталов...")
-        blocks = generate_courtyard_blocks(site_data, config)
+        num_variants = min(args.variants, 5)
+        all_results = []  # для сравнения вариантов
 
-        # Внутренние проезды между кварталами
-        internal_roads = generate_internal_roads(blocks, site_data)
-        if internal_roads:
-            print(f"  Внутренние проезды: {len(internal_roads)}")
-            site_data["internal_roads"] = internal_roads
+        for variant_idx in range(num_variants):
+            variant_seed = 42 + variant_idx * 17
+            variant_label = f" (вариант {variant_idx + 1}/{num_variants}, seed={variant_seed})" if num_variants > 1 else ""
 
-        # Генерируем infill-слоты в пустых зонах между кварталами
-        slots = None
-        infill = None
-        if len(blocks) < 3:
-            print("  Мало кварталов, переключаюсь на слоты...")
-            slots = generate_building_slots(site_data, config)
-        else:
-            # Добавляем infill — отдельные здания в пустых зонах
-            infill = generate_infill_buildings(site_data, config, blocks)
-            if infill:
-                print(f"  + {len(infill)} infill-зданий в пустых зонах")
+            if num_variants > 1:
+                print(f"\n{'='*60}")
+                print(f"  ВАРИАНТ {variant_idx + 1}/{num_variants} (seed={variant_seed})")
+                print(f"{'='*60}")
 
-        # Генерация массинга
-        prev_errors = []
-        for attempt in range(1, args.max_retries + 1):
-            print(f"\nГенерация массинга (попытка {attempt}/{args.max_retries})...")
-            prompt = build_prompt(site_data, config, slots=slots,
-                                 blocks=blocks if not slots else None,
-                                 infill=infill if not slots else None)
-            if prev_errors:
-                prompt += "\n\n## ОШИБКИ ПРЕДЫДУЩЕЙ ПОПЫТКИ (исправь их!)\n"
-                for err in prev_errors:
-                    prompt += f"- {err}\n"
-                prompt += "\nВСЕ здания ОБЯЗАНЫ находиться ВНУТРИ полигона участка с учётом отступов. Используй координаты полигона, а не bounding box."
-            massing = generate_massing(prompt, args.api_key, args.base_url)
+            # Устанавливаем seed для воспроизводимости варианта
+            import random
+            random.seed(variant_seed)
 
+            # Генерация кварталов
+            print("\nГенерация кварталов...")
+            blocks = generate_courtyard_blocks(site_data, config)
+
+            # Внутренние проезды между кварталами
+            internal_roads = generate_internal_roads(blocks, site_data)
+            if internal_roads:
+                print(f"  Внутренние проезды: {len(internal_roads)}")
+                site_data["internal_roads"] = internal_roads
+
+            # Генерируем infill-слоты в пустых зонах между кварталами
+            slots = None
+            infill = None
+            if len(blocks) < 3:
+                print("  Мало кварталов, переключаюсь на слоты...")
+                slots = generate_building_slots(site_data, config)
+            else:
+                infill = generate_infill_buildings(site_data, config, blocks)
+                if infill:
+                    print(f"  + {len(infill)} infill-зданий в пустых зонах")
+
+            # Генерация массинга
+            prev_errors = []
+            for attempt in range(1, args.max_retries + 1):
+                print(f"\nГенерация массинга (попытка {attempt}/{args.max_retries})...")
+                prompt = build_prompt(site_data, config, slots=slots,
+                                     blocks=blocks if not slots else None,
+                                     infill=infill if not slots else None)
+                if prev_errors:
+                    prompt += "\n\n## ОШИБКИ ПРЕДЫДУЩЕЙ ПОПЫТКИ (исправь их!)\n"
+                    for err in prev_errors:
+                        prompt += f"- {err}\n"
+                    prompt += "\nВСЕ здания ОБЯЗАНЫ находиться ВНУТРИ полигона участка с учётом отступов."
+                massing = generate_massing(prompt, args.api_key, args.base_url)
+
+                summary = massing.get("summary", {})
+                print(f"  Зданий: {summary.get('total_buildings', '?')}")
+                print(f"  Продаваемая площадь: {summary.get('total_sellable_area', '?')} м²")
+                print(f"  Плотность: {summary.get('density', '?')}")
+
+                if blocks and not slots:
+                    _inject_block_ids(massing, blocks)
+
+                errors = validate_massing(massing, site_data, config)
+                if not errors:
+                    print("  Валидация: OK")
+                    break
+                else:
+                    print(f"  Ошибки валидации:")
+                    for err in errors:
+                        print(f"    - {err}")
+                    prev_errors = errors
+                    if attempt < args.max_retries:
+                        print("  Повторная генерация с учётом ошибок...")
+            else:
+                print("\nНе удалось сгенерировать валидный массинг. Обрезаем и сохраняем.")
+
+            # Пост-обработка
+            print("\nПост-обработка...")
+            massing = clip_massing_to_buildable(massing, site_data, config)
             summary = massing.get("summary", {})
-            print(f"  Зданий: {summary.get('total_buildings', '?')}")
-            print(f"  Продаваемая площадь: {summary.get('total_sellable_area', '?')} м²")
-            print(f"  Плотность: {summary.get('density', '?')}")
+            print(f"  Финальный результат: {summary.get('total_buildings', 0)} зданий, "
+                  f"{summary.get('total_sellable_area', 0)} м² продаваемой площади")
 
-            # Инъекция block_id: сопоставляем здания с блоками по proximity
-            if blocks and not slots:
-                _inject_block_ids(massing, blocks)
+            # Расчёт квартир и паркинга
+            total_sell = summary.get("total_sellable_area", 0)
+            avg_apartment_m2 = 55
+            est_apartments = round(total_sell / avg_apartment_m2) if total_sell else 0
+            est_parking = round(est_apartments * 0.7)
+            est_residents = round(est_apartments * 2.3)
+            summary["est_apartments"] = est_apartments
+            summary["est_parking_spots"] = est_parking
+            summary["est_residents"] = est_residents
+            print(f"  Расчётные квартиры: ~{est_apartments} (ср. {avg_apartment_m2} м²)")
+            print(f"  Паркинг: ~{est_parking} м/м | Жители: ~{est_residents} чел.")
 
-            # Валидация
-            errors = validate_massing(massing, site_data, config)
-            if not errors:
-                print("  Валидация: OK")
-                break
+            # Проверка инсоляции
+            print("\nПроверка инсоляции (22 марта, СанПиН)...")
+            insol_violations = check_insolation(massing, config)
+            if insol_violations:
+                print(f"  Нарушения инсоляции: {len(insol_violations)} зданий")
+                for v in insol_violations:
+                    print(f"    Здание {v['building_id']} ({v['floors']}эт): "
+                          f"макс. непрерывно {v['max_continuous']}ч (нужно {v['required']}ч)")
+                print("  Корректировка этажности...")
+                fix_insolation_violations(massing, insol_violations, config)
+                buildings = massing.get("buildings", [])
+                total_gross = sum(b.get("gross_area", 0) for b in buildings)
+                total_sell = sum(b.get("sellable_area", 0) for b in buildings)
+                massing["summary"]["total_gross_area"] = total_gross
+                massing["summary"]["total_sellable_area"] = total_sell
+                massing["summary"]["density"] = round(total_gross / site_data["area_m2"], 2)
+                insol_v2 = check_insolation(massing, config)
+                if insol_v2:
+                    print(f"  После корректировки: ещё {len(insol_v2)} нарушений (допустимо для MVP)")
+                else:
+                    print("  Инсоляция: OK после корректировки")
             else:
-                print(f"  Ошибки валидации:")
-                for err in errors:
-                    print(f"    - {err}")
-                prev_errors = errors
-                if attempt < args.max_retries:
-                    print("  Повторная генерация с учётом ошибок...")
-        else:
-            print("\nНе удалось сгенерировать валидный массинг. Обрезаем и сохраняем.")
+                print("  Инсоляция: OK")
 
-        # Пост-обработка: удалить здания вне зоны
-        print("\nПост-обработка...")
-        massing = clip_massing_to_buildable(massing, site_data, config)
-        summary = massing.get("summary", {})
-        print(f"  Финальный результат: {summary.get('total_buildings', 0)} зданий, "
-              f"{summary.get('total_sellable_area', 0)} м² продаваемой площади")
+            # Визуализация
+            suffix = f"_v{variant_idx + 1}" if num_variants > 1 else "_latest"
+            viz_path = input_path.parent / "test_output" / f"massing{suffix}.png"
+            viz_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                visualize_massing(massing, site_data, str(viz_path), config=config)
+            except Exception as e:
+                print(f"  Визуализация не удалась: {e}")
 
-        # Расчёт квартир и паркинга
-        total_sell = summary.get("total_sellable_area", 0)
-        avg_apartment_m2 = 55  # средняя квартира ~55 м²
-        est_apartments = round(total_sell / avg_apartment_m2) if total_sell else 0
-        est_parking = round(est_apartments * 0.7)  # 0.7 м/м по нормам
-        est_residents = round(est_apartments * 2.3)  # 2.3 чел/квартиру
-        summary["est_apartments"] = est_apartments
-        summary["est_parking_spots"] = est_parking
-        summary["est_residents"] = est_residents
-        print(f"  Расчётные квартиры: ~{est_apartments} (ср. {avg_apartment_m2} м²)")
-        print(f"  Паркинг: ~{est_parking} м/м | Жители: ~{est_residents} чел.")
+            # Запись DXF
+            dxf_suffix = f"_v{variant_idx + 1}" if num_variants > 1 else ""
+            output_dxf = Path(tmpdir) / f"{input_path.stem}_massing{dxf_suffix}.dxf"
+            write_massing_to_dxf(massing, site_data, str(output_dxf))
 
-        # Проверка инсоляции
-        print("\nПроверка инсоляции (22 марта, СанПиН)...")
-        insol_violations = check_insolation(massing, config)
-        if insol_violations:
-            print(f"  Нарушения инсоляции: {len(insol_violations)} зданий")
-            for v in insol_violations:
-                print(f"    Здание {v['building_id']} ({v['floors']}эт): "
-                      f"макс. непрерывно {v['max_continuous']}ч (нужно {v['required']}ч)")
-            print("  Корректировка этажности...")
-            fix_insolation_violations(massing, insol_violations, config)
-            # Пересчёт summary
-            buildings = massing.get("buildings", [])
-            total_gross = sum(b.get("gross_area", 0) for b in buildings)
-            total_sell = sum(b.get("sellable_area", 0) for b in buildings)
-            massing["summary"]["total_gross_area"] = total_gross
-            massing["summary"]["total_sellable_area"] = total_sell
-            massing["summary"]["density"] = round(total_gross / site_data["area_m2"], 2)
-            # Повторная проверка
-            insol_v2 = check_insolation(massing, config)
-            if insol_v2:
-                print(f"  После корректировки: ещё {len(insol_v2)} нарушений (допустимо для MVP)")
+            # Выходной путь
+            if args.output:
+                base_output = Path(args.output)
+                if num_variants > 1:
+                    final_output = base_output.parent / f"{base_output.stem}_v{variant_idx + 1}{base_output.suffix}"
+                else:
+                    final_output = base_output
             else:
-                print("  Инсоляция: OK после корректировки")
-        else:
-            print("  Инсоляция: OK")
+                final_output = input_path.parent / f"{input_path.stem}_massing{input_path.suffix}"
 
-        # Визуализация
-        viz_path = input_path.parent / "test_output" / "massing_latest.png"
-        viz_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            visualize_massing(massing, site_data, str(viz_path), config=config)
-        except Exception as e:
-            print(f"  Визуализация не удалась: {e}")
+            if final_output.suffix.lower() == ".dwg":
+                print("Конвертация DXF → DWG...")
+                result_dwg = convert_dxf_to_dwg(str(output_dxf), str(final_output.parent), args.oda_path)
+                print(f"\nГотово: {result_dwg}")
+            else:
+                import shutil
+                shutil.copy2(str(output_dxf), str(final_output))
+                print(f"\nГотово: {final_output}")
 
-        # Запись результата в DXF
-        output_dxf = Path(tmpdir) / f"{input_path.stem}_massing.dxf"
-        write_massing_to_dxf(massing, site_data, str(output_dxf))
+            # JSON
+            json_output = final_output.with_suffix(".json")
+            with open(json_output, "w") as f:
+                json.dump(massing, f, indent=2, ensure_ascii=False)
+            print(f"JSON: {json_output}")
 
-        # Определяем выходной путь
-        if args.output:
-            final_output = Path(args.output)
-        else:
-            final_output = input_path.parent / f"{input_path.stem}_massing{input_path.suffix}"
+            # Запоминаем для сравнения
+            summary = massing.get("summary", {})
+            all_results.append({
+                "variant": variant_idx + 1,
+                "seed": variant_seed,
+                "buildings": summary.get("total_buildings", 0),
+                "sellable_area": summary.get("total_sellable_area", 0),
+                "density": summary.get("density", 0),
+                "apartments": summary.get("est_apartments", 0),
+                "parking": summary.get("est_parking_spots", 0),
+                "viz": str(viz_path),
+            })
 
-        # Конвертация обратно в DWG если нужно
-        if final_output.suffix.lower() == ".dwg":
-            print("Конвертация DXF → DWG...")
-            result_dwg = convert_dxf_to_dwg(str(output_dxf), str(final_output.parent), args.oda_path)
-            print(f"\nГотово: {result_dwg}")
-        else:
-            import shutil
-            shutil.copy2(str(output_dxf), str(final_output))
-            print(f"\nГотово: {final_output}")
-
-        # Сохраняем JSON для отладки
-        json_output = final_output.with_suffix(".json")
-        with open(json_output, "w") as f:
-            json.dump(massing, f, indent=2, ensure_ascii=False)
-        print(f"JSON: {json_output}")
+        # Сравнительная таблица (если несколько вариантов)
+        if num_variants > 1 and all_results:
+            print(f"\n{'='*60}")
+            print("  СРАВНЕНИЕ ВАРИАНТОВ")
+            print(f"{'='*60}")
+            print(f"  {'#':<4} {'Зданий':<8} {'Площадь':>10} {'Плотн.':>8} {'Кв-ры':>8} {'Парк.':>8}")
+            print(f"  {'-'*4} {'-'*8} {'-'*10} {'-'*8} {'-'*8} {'-'*8}")
+            best = max(all_results, key=lambda r: r["sellable_area"])
+            for r in all_results:
+                marker = " ★" if r == best else ""
+                print(f"  v{r['variant']:<3} {r['buildings']:<8} {r['sellable_area']:>10,} {r['density']:>8} {r['apartments']:>8,} {r['parking']:>8,}{marker}")
+            print(f"\n  Лучший: вариант {best['variant']} ({best['viz']})")
 
 
 if __name__ == "__main__":
