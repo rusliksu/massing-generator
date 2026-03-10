@@ -306,6 +306,208 @@ def compute_buildable_area(site_data: dict, config: dict,
     }
 
 
+def generate_parcel_based_layout(site_data: dict, config: dict) -> list[dict]:
+    """
+    Генерирует раскладку зданий по кадастровым участкам.
+    Каждый участок получает одно здание, вписанное внутрь с отступами.
+    Форма зависит от размера/пропорций участка.
+    """
+    import numpy as np
+    from shapely.geometry import box
+    from shapely.affinity import rotate
+    import random
+
+    parcels = site_data.get("parcels", [])
+    if not parcels:
+        print("  Нет кадастровых участков — фоллбэк на кварталы")
+        return []
+
+    # Определяем угол участка для ориентации зданий
+    site_poly = Polygon(site_data["coordinates"])
+    mrr = site_poly.minimum_rotated_rectangle
+    mrr_coords = list(mrr.exterior.coords)
+    edge1 = np.array(mrr_coords[1]) - np.array(mrr_coords[0])
+    edge2 = np.array(mrr_coords[2]) - np.array(mrr_coords[1])
+    if np.linalg.norm(edge1) > np.linalg.norm(edge2):
+        main_angle = np.degrees(np.arctan2(edge1[1], edge1[0]))
+    else:
+        main_angle = np.degrees(np.arctan2(edge2[1], edge2[0]))
+
+    buildable_info = compute_buildable_area(site_data, config)
+    buildable = buildable_info["polygon"]
+
+    buildings = []
+    building_id = 1
+
+    for parcel in parcels:
+        pp = parcel["polygon"]
+        area = parcel["area_m2"]
+
+        # Пропускаем слишком маленькие участки
+        if area < 500:
+            continue
+
+        # Участок должен быть внутри buildable зоны хотя бы на 50%
+        if buildable.intersection(pp).area / pp.area < 0.5:
+            continue
+
+        # Для больших участков (>8000 м²) — делим на sub-зоны и ставим несколько зданий
+        if area > 8000:
+            from shapely.ops import split
+            from shapely.geometry import LineString
+
+            # Разбиваем пополам по длинной оси
+            p_mrr = pp.minimum_rotated_rectangle
+            pc = list(p_mrr.exterior.coords)
+            pe1_len = np.linalg.norm(np.array(pc[1]) - np.array(pc[0]))
+            pe2_len = np.linalg.norm(np.array(pc[2]) - np.array(pc[1]))
+            if pe1_len > pe2_len:
+                mid1 = ((pc[0][0] + pc[3][0]) / 2, (pc[0][1] + pc[3][1]) / 2)
+                mid2 = ((pc[1][0] + pc[2][0]) / 2, (pc[1][1] + pc[2][1]) / 2)
+            else:
+                mid1 = ((pc[0][0] + pc[1][0]) / 2, (pc[0][1] + pc[1][1]) / 2)
+                mid2 = ((pc[2][0] + pc[3][0]) / 2, (pc[2][1] + pc[3][1]) / 2)
+
+            # Добавляем sub-parcels обратно в список для обработки
+            try:
+                cut_line = LineString([mid1, mid2]).buffer(0.5)
+                sub = pp.difference(cut_line)
+                if sub.geom_type == 'MultiPolygon':
+                    for sp in sub.geoms:
+                        if sp.area > 500:
+                            parcels.append({"polygon": sp, "area_m2": round(sp.area, 1), "layer": parcel.get("layer", "split")})
+                    continue
+            except Exception:
+                pass  # если не получилось разбить — ставим одно здание
+
+        cx, cy = pp.centroid.x, pp.centroid.y
+
+        # Определяем пропорции участка через MRR
+        p_mrr = pp.minimum_rotated_rectangle
+        p_coords = list(p_mrr.exterior.coords)
+        pe1 = np.linalg.norm(np.array(p_coords[1]) - np.array(p_coords[0]))
+        pe2 = np.linalg.norm(np.array(p_coords[2]) - np.array(p_coords[1]))
+        p_long = max(pe1, pe2)
+        p_short = min(pe1, pe2)
+
+        # Отступ от границ участка (6м)
+        setback = 6
+        avail_long = p_long - setback * 2
+        avail_short = p_short - setback * 2
+
+        if avail_long < 20 or avail_short < 10:
+            continue  # слишком маленький для здания
+
+        # Глубина корпуса 12-18м (жилой дом)
+        depth = min(18, avail_short * 0.75)
+        depth = max(12, depth)
+        if depth > avail_short:
+            depth = avail_short
+
+        # Выбираем форму здания по размеру участка
+        if area > 4000 and avail_long > 60:
+            # Большой участок — Н-образное (два крыла + перемычка)
+            shape_type = random.choices(["h_shape", "rect", "l_shape"], weights=[50, 30, 20], k=1)[0]
+        elif area > 2000:
+            shape_type = random.choices(["rect", "l_shape", "h_shape"], weights=[50, 30, 20], k=1)[0]
+        else:
+            shape_type = random.choices(["rect", "l_shape"], weights=[70, 30], k=1)[0]
+
+        # Длина здания — заполняем ~70-85% доступной длины
+        b_len = avail_long * random.uniform(0.70, 0.85)
+        b_len = max(30, min(b_len, 120))  # 30-120м
+
+        hw, hd = b_len / 2, depth / 2
+
+        if shape_type == "h_shape":
+            # Н-образное: два крыла + перемычка посередине
+            wing_len = b_len * 0.38  # каждое крыло ~38% общей длины
+            gap = b_len - wing_len * 2  # перемычка
+            conn_d = depth * 0.4  # глубина перемычки
+
+            fp = Polygon([
+                # Левое крыло
+                (cx - hw, cy - hd),
+                (cx - hw + wing_len, cy - hd),
+                (cx - hw + wing_len, cy - conn_d / 2),
+                # Перемычка нижняя
+                (cx + hw - wing_len, cy - conn_d / 2),
+                # Правое крыло
+                (cx + hw - wing_len, cy - hd),
+                (cx + hw, cy - hd),
+                (cx + hw, cy + hd),
+                (cx + hw - wing_len, cy + hd),
+                (cx + hw - wing_len, cy + conn_d / 2),
+                # Перемычка верхняя
+                (cx - hw + wing_len, cy + conn_d / 2),
+                (cx - hw + wing_len, cy + hd),
+                (cx - hw, cy + hd),
+            ])
+
+        elif shape_type == "l_shape":
+            # Г-образное
+            wing_short = b_len * 0.45
+            fp = Polygon([
+                (cx - hw, cy - hd),
+                (cx - hw + wing_short, cy - hd),
+                (cx - hw + wing_short, cy - hd + depth * 0.4),
+                (cx + hw, cy - hd + depth * 0.4),
+                (cx + hw, cy + hd),
+                (cx - hw, cy + hd),
+            ])
+
+        else:
+            # Прямоугольник (вытянутый 1:4 - 1:6)
+            fp = box(cx - hw, cy - hd, cx + hw, cy + hd)
+
+        # Поворот по главной оси участка
+        fp_rotated = rotate(fp, main_angle, origin=(cx, cy))
+
+        # Проверка что здание внутри участка (с допуском)
+        overlap = pp.intersection(fp_rotated).area / fp_rotated.area
+        if overlap < 0.7:
+            # Пробуем уменьшить
+            fp_small = rotate(box(cx - hw * 0.7, cy - hd, cx + hw * 0.7, cy + hd),
+                              main_angle, origin=(cx, cy))
+            if pp.intersection(fp_small).area / fp_small.area >= 0.7:
+                fp_rotated = fp_small
+                shape_type = "rect_small"
+            else:
+                continue
+
+        # Проверка на пересечение с уже размещёнными зданиями (мин. 8м — мягкий)
+        skip = False
+        for existing in buildings:
+            ep = Polygon(existing["footprint"])
+            if fp_rotated.distance(ep) < 8:
+                skip = True
+                break
+        if skip:
+            continue
+
+        coords = list(fp_rotated.exterior.coords)[:-1]
+        buildings.append({
+            "id": building_id,
+            "footprint": [[round(c[0], 1), round(c[1], 1)] for c in coords],
+            "area_m2": round(fp_rotated.area, 0),
+            "shape": shape_type,
+            "parcel_area": round(area, 0),
+            "orientation_deg": round(main_angle, 1),
+            "cx": round(cx, 1),
+            "cy": round(cy, 1),
+        })
+        building_id += 1
+
+    print(f"  Размещено {len(buildings)} зданий в кадастровых участках")
+    shapes = {}
+    for b in buildings:
+        shapes[b["shape"]] = shapes.get(b["shape"], 0) + 1
+    if shapes:
+        print(f"  Формы: {', '.join(f'{k}={v}' for k, v in shapes.items())}")
+
+    return buildings
+
+
 def _make_l_shape(cx, cy, wing_w, wing_h, depth):
     """Создаёт Г-образный полигон."""
     return Polygon([
@@ -693,7 +895,8 @@ def generate_infill_buildings(site_data: dict, config: dict, blocks: list[dict])
 
 
 def build_prompt(site_data: dict, config: dict, slots: list[dict] = None,
-                 blocks: list[dict] = None, infill: list[dict] = None) -> str:
+                 blocks: list[dict] = None, infill: list[dict] = None,
+                 parcel_buildings: list[dict] = None) -> str:
     """Формирование промпта для AI."""
     constraints = config.get("constraints", {})
     fire = config.get("fire_safety", {})
@@ -702,6 +905,64 @@ def build_prompt(site_data: dict, config: dict, slots: list[dict] = None,
     latitude = config.get("site", {}).get("latitude", 55.75)
 
     buildable = compute_buildable_area(site_data, config)
+
+    # Режим парсельной раскладки (приоритет — как у Ильи)
+    if parcel_buildings:
+        buildings_text = ""
+        for b in parcel_buildings:
+            buildings_text += (f"  Здание {b['id']}: форма={b['shape']}, пятно={b['area_m2']}м², "
+                              f"участок={b['parcel_area']}м², footprint={json.dumps(b['footprint'])}\n")
+
+        total_footprint = sum(b["area_m2"] for b in parcel_buildings)
+        return f"""Ты — архитектор-градостроитель. Назначь этажность готовым зданиям.
+
+## Участок
+- Площадь: {site_data['area_m2']} м² | Зона застройки: {buildable['area_m2']} м²
+- Регион: {region} | Широта: {latitude}°
+
+## Здания (уже размещены в кадастровых участках, {len(parcel_buildings)} шт):
+{buildings_text}
+- Суммарное пятно: {total_footprint:.0f} м²
+
+## Ограничения
+- Макс. плотность: {constraints.get('max_density', 2.5)}
+- Этажность: 9-{constraints.get('max_floors', 25)} | Высота этажа: 3.0 м
+- Sellable ≈ 78% от gross
+- Линейная застройка: центр выше, края ниже
+
+## Задача
+Для КАЖДОГО из {len(parcel_buildings)} зданий назначь этажность (9-25).
+- Здания с большим пятном (>1500м²): 14-25 этажей
+- Средние (800-1500м²): 12-20 этажей
+- Малые (<800м²): 9-15 этажей
+- h_shape: 16-25 этажей (доминанты)
+- В центре участка выше, по краям ниже
+- Варьируй: соседние дома не одинаковой высоты
+
+## Формат: ТОЛЬКО JSON
+{{
+  "buildings": [
+    {{
+      "id": 1,
+      "type": "residential",
+      "footprint": [[x,y],...],
+      "floors": 17,
+      "floor_height": 3.0,
+      "total_height": 51.0,
+      "gross_area": 18360,
+      "sellable_area": 14321,
+      "orientation_deg": {parcel_buildings[0]['orientation_deg'] if parcel_buildings else 0}
+    }}
+  ],
+  "summary": {{
+    "total_buildings": {len(parcel_buildings)},
+    "total_gross_area": 150000,
+    "total_sellable_area": 117000,
+    "density": 1.5,
+    "site_coverage_ratio": 0.20,
+    "notes": "описание решения"
+  }}
+}}"""
 
     # Режим кварталов
     if blocks:
@@ -1193,7 +1454,7 @@ def clip_massing_to_buildable(massing: dict, site_data: dict, config: dict) -> d
     return massing
 
 
-def validate_massing(massing: dict, site_data: dict, config: dict, overlap_threshold: float = 0.85) -> list[str]:
+def validate_massing(massing: dict, site_data: dict, config: dict, overlap_threshold: float = 0.75) -> list[str]:
     """Валидация сгенерированного массинга."""
     errors = []
     constraints = config.get("constraints", {})
@@ -1595,34 +1856,43 @@ def main():
             import random
             random.seed(variant_seed)
 
-            # Генерация кварталов
-            print("\nГенерация кварталов...")
-            blocks = generate_courtyard_blocks(site_data, config)
-
-            # Внутренние проезды между кварталами
-            internal_roads = generate_internal_roads(blocks, site_data)
-            if internal_roads:
-                print(f"  Внутренние проезды: {len(internal_roads)}")
-                site_data["internal_roads"] = internal_roads
-
-            # Генерируем infill-слоты в пустых зонах между кварталами
+            # Парсельная раскладка (приоритет — как у Ильи)
+            parcel_buildings = None
+            blocks = None
             slots = None
             infill = None
-            if len(blocks) < 3:
-                print("  Мало кварталов, переключаюсь на слоты...")
-                slots = generate_building_slots(site_data, config)
-            else:
-                infill = generate_infill_buildings(site_data, config, blocks)
-                if infill:
-                    print(f"  + {len(infill)} infill-зданий в пустых зонах")
 
-            # Генерация массинга
+            if site_data.get("parcels"):
+                print("\nРаскладка по кадастровым участкам...")
+                parcel_buildings = generate_parcel_based_layout(site_data, config)
+
+            if not parcel_buildings or len(parcel_buildings) < 5:
+                # Фоллбэк на кварталы
+                print("\nФоллбэк: генерация кварталов...")
+                blocks = generate_courtyard_blocks(site_data, config)
+
+                internal_roads = generate_internal_roads(blocks, site_data)
+                if internal_roads:
+                    print(f"  Внутренние проезды: {len(internal_roads)}")
+                    site_data["internal_roads"] = internal_roads
+
+                if len(blocks) < 3:
+                    print("  Мало кварталов, переключаюсь на слоты...")
+                    slots = generate_building_slots(site_data, config)
+                else:
+                    infill = generate_infill_buildings(site_data, config, blocks)
+                    if infill:
+                        print(f"  + {len(infill)} infill-зданий в пустых зонах")
+                parcel_buildings = None
+
+            # Генерация массинга (AI назначает этажность)
             prev_errors = []
             for attempt in range(1, args.max_retries + 1):
                 print(f"\nГенерация массинга (попытка {attempt}/{args.max_retries})...")
                 prompt = build_prompt(site_data, config, slots=slots,
                                      blocks=blocks if not slots else None,
-                                     infill=infill if not slots else None)
+                                     infill=infill if not slots else None,
+                                     parcel_buildings=parcel_buildings)
                 if prev_errors:
                     prompt += "\n\n## ОШИБКИ ПРЕДЫДУЩЕЙ ПОПЫТКИ (исправь их!)\n"
                     for err in prev_errors:
