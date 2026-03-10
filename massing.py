@@ -146,7 +146,80 @@ def compute_buildable_area(site_data: dict, config: dict) -> dict:
     }
 
 
-def build_prompt(site_data: dict, config: dict) -> str:
+def generate_building_slots(site_data: dict, config: dict,
+                             building_sizes: list[tuple[float, float]] = None) -> list[dict]:
+    """
+    Генерирует сетку допустимых позиций для зданий внутри buildable polygon.
+    Возвращает список слотов с координатами footprint.
+    """
+    import numpy as np
+    from shapely.geometry import box
+    from shapely.affinity import rotate
+
+    buildable_info = compute_buildable_area(site_data, config)
+    buildable = buildable_info["polygon"]
+    fire_dist = config.get("fire_safety", {}).get("min_distance", 12)
+
+    if building_sizes is None:
+        building_sizes = [
+            (60, 18),   # Секционный дом (длинный)
+            (45, 18),   # Секционный дом (средний)
+            (30, 18),   # Секционный дом (короткий)
+            (24, 24),   # Точечный дом (башня)
+        ]
+
+    bounds = buildable.bounds  # (minx, miny, maxx, maxy)
+    slots = []
+    slot_id = 1
+
+    # Определяем основное направление участка (ориентация)
+    # Используем minimum rotated rectangle для определения угла
+    mrr = buildable.minimum_rotated_rectangle
+    mrr_coords = list(mrr.exterior.coords)
+    edge1 = np.array(mrr_coords[1]) - np.array(mrr_coords[0])
+    edge2 = np.array(mrr_coords[2]) - np.array(mrr_coords[1])
+    # Длинная сторона определяет направление
+    if np.linalg.norm(edge1) > np.linalg.norm(edge2):
+        main_angle = np.degrees(np.arctan2(edge1[1], edge1[0]))
+    else:
+        main_angle = np.degrees(np.arctan2(edge2[1], edge2[0]))
+
+    # Шаг сетки — максимальный размер здания + пожарный разрыв
+    max_size = max(max(s) for s in building_sizes)
+    grid_step = max_size + fire_dist
+
+    # Генерируем сетку точек внутри buildable polygon
+    x_range = np.arange(bounds[0] + max_size/2, bounds[2] - max_size/2, grid_step)
+    y_range = np.arange(bounds[1] + max_size/2, bounds[3] - max_size/2, grid_step)
+
+    for bw, bh in building_sizes:
+        for cx in x_range:
+            for cy in y_range:
+                # Создаём footprint здания с центром в (cx, cy)
+                half_w, half_h = bw / 2, bh / 2
+                building_box = box(cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+
+                # Поворачиваем по направлению участка
+                rotated = rotate(building_box, main_angle, origin='centroid')
+
+                # Проверяем что здание полностью внутри buildable area
+                if buildable.contains(rotated):
+                    fp = list(rotated.exterior.coords)[:-1]  # без замыкающей точки
+                    slots.append({
+                        "slot_id": slot_id,
+                        "center": [round(cx, 1), round(cy, 1)],
+                        "size": f"{bw}x{bh}",
+                        "footprint": [[round(p[0], 1), round(p[1], 1)] for p in fp],
+                        "area_m2": round(bw * bh, 0),
+                        "orientation_deg": round(main_angle, 1),
+                    })
+                    slot_id += 1
+
+    print(f"  Сгенерировано {len(slots)} допустимых слотов для зданий")
+    return slots
+
+
+def build_prompt(site_data: dict, config: dict, slots: list[dict] = None) -> str:
     """Формирование промпта для AI."""
     constraints = config.get("constraints", {})
     fire = config.get("fire_safety", {})
@@ -155,36 +228,37 @@ def build_prompt(site_data: dict, config: dict) -> str:
     latitude = config.get("site", {}).get("latitude", 55.75)
 
     buildable = compute_buildable_area(site_data, config)
-    buildable_coords = buildable["simplified_coords"]
 
-    return f"""Ты — архитектор-градостроитель. Сгенерируй оптимальный массинг (объёмно-пространственное решение) для жилой застройки.
+    # Если есть слоты — режим выбора из готовых позиций
+    if slots:
+        slots_summary = []
+        for s in slots:
+            slots_summary.append(f"  Слот {s['slot_id']}: центр={s['center']}, размер={s['size']}, площадь={s['area_m2']}м²")
+        slots_text = "\n".join(slots_summary)
 
-## Зона застройки (отступы уже учтены!)
-- Координаты зоны (в метрах): {json.dumps(buildable_coords)}
-- Площадь зоны: {buildable['area_m2']} м²
-- Размеры: {buildable['width']} x {buildable['height']} м
-- Площадь участка (до отступов): {site_data['area_m2']} м²
+        return f"""Ты — архитектор-градостроитель. Выбери оптимальный набор зданий из предложенных позиций.
 
-КРИТИЧЕСКИ ВАЖНО: ВСЕ footprint-координаты зданий ДОЛЖНЫ находиться СТРОГО ВНУТРИ зоны застройки.
-Проверяй каждую координату: она должна быть внутри полигона зоны.
+## Участок
+- Площадь: {site_data['area_m2']} м²
+- Площадь зоны застройки (с отступами): {buildable['area_m2']} м²
+
+## Доступные позиции для зданий (все гарантированно внутри зоны застройки):
+{slots_text}
 
 ## Ограничения
 - Макс. плотность застройки: {constraints.get('max_density', 2.5)}
 - Целевая продаваемая площадь: {constraints.get('target_area', 45000)} м²
 - Макс. этажность: {constraints.get('max_floors', 25)}
 - Высота этажа: {constraints.get('min_floor_height', 3.0)} м
-- Sellable area ≈ 75-80% от gross area (типовой коэффициент)
+- Sellable area ≈ 75-80% от gross area
+- Мин. расстояние между зданиями: {fire.get('min_distance', 12)} м (уже учтено в сетке)
+- Регион: {region}, широта: {latitude}° — учитывай инсоляцию
 
-## Пожарная безопасность
-- Мин. расстояние между зданиями: {fire.get('min_distance', 12)} м
-
-## Инсоляция
-- Регион: {region}, широта: {latitude}°
-- Мин. часы инсоляции: {insol.get('min_hours', 2.0)} ч
-- Ориентируй здания для максимальной инсоляции (юг/юго-восток предпочтительнее)
-
-## Нормативная база
-Учитывай: СП 42.13330, СанПиН по инсоляции, противопожарные нормы для региона {region}.
+## Задача
+Выбери слоты и назначь этажность для каждого. Цель: максимум продаваемой площади при соблюдении плотности.
+Предпочитай длинные секционные дома (60x18, 45x18) — они типичнее для жилых кварталов.
+Распределяй здания по всей территории, не скапливай в одном месте.
+Варьируй этажность: от 9 до {constraints.get('max_floors', 25)} этажей.
 
 ## Формат ответа
 Верни ТОЛЬКО валидный JSON (без markdown):
@@ -192,27 +266,52 @@ def build_prompt(site_data: dict, config: dict) -> str:
   "buildings": [
     {{
       "id": 1,
+      "slot_id": 5,
       "type": "residential",
       "footprint": [[x1,y1], [x2,y2], [x3,y3], [x4,y4]],
-      "floors": 22,
+      "floors": 17,
       "floor_height": 3.0,
-      "total_height": 66.0,
-      "gross_area": 15000,
-      "sellable_area": 12000,
+      "total_height": 51.0,
+      "gross_area": 18360,
+      "sellable_area": 14688,
       "orientation_deg": 15
     }}
   ],
   "summary": {{
-    "total_buildings": 3,
-    "total_gross_area": 50000,
-    "total_sellable_area": 45000,
+    "total_buildings": 8,
+    "total_gross_area": 150000,
+    "total_sellable_area": 120000,
     "density": 2.3,
-    "site_coverage_ratio": 0.35,
+    "site_coverage_ratio": 0.25,
     "notes": "описание решения"
   }}
-}}
+}}"""
 
-Оптимизируй по: максимум продаваемой площади при соблюдении всех норм."""
+    # Фоллбэк — старый режим без слотов
+    buildable_coords = buildable["simplified_coords"]
+
+    return f"""Ты — архитектор-градостроитель. Сгенерируй оптимальный массинг для жилой застройки.
+
+## Зона застройки (отступы уже учтены!)
+- Координаты зоны (в метрах): {json.dumps(buildable_coords)}
+- Площадь зоны: {buildable['area_m2']} м²
+- Площадь участка (до отступов): {site_data['area_m2']} м²
+
+ВСЕ footprint-координаты зданий ДОЛЖНЫ быть СТРОГО ВНУТРИ зоны застройки.
+
+## Ограничения
+- Макс. плотность: {constraints.get('max_density', 2.5)} | Целевая площадь: {constraints.get('target_area', 45000)} м²
+- Макс. этажность: {constraints.get('max_floors', 25)} | Высота этажа: {constraints.get('min_floor_height', 3.0)} м
+- Sellable ≈ 75-80% от gross | Мин. разрыв: {fire.get('min_distance', 12)} м
+- Регион: {region}, широта: {latitude}°
+
+## Формат: ТОЛЬКО валидный JSON
+{{
+  "buildings": [{{ "id": 1, "type": "residential", "footprint": [[x1,y1],...], "floors": 22,
+    "floor_height": 3.0, "total_height": 66.0, "gross_area": 15000, "sellable_area": 12000, "orientation_deg": 15 }}],
+  "summary": {{ "total_buildings": 3, "total_gross_area": 50000, "total_sellable_area": 45000,
+    "density": 2.3, "site_coverage_ratio": 0.35, "notes": "описание" }}
+}}"""
 
 
 def generate_massing(prompt: str, api_key: str = None, base_url: str = None) -> dict:
@@ -246,10 +345,12 @@ def generate_massing(prompt: str, api_key: str = None, base_url: str = None) -> 
 
 
 def clip_massing_to_buildable(massing: dict, site_data: dict, config: dict) -> dict:
-    """Удаляет здания с overlap <50% от зоны застройки."""
+    """Удаляет здания с overlap <50% и пересекающиеся здания."""
     buildable_info = compute_buildable_area(site_data, config)
     buildable_area = buildable_info["polygon"]
+    fire_dist = config.get("fire_safety", {}).get("min_distance", 12)
 
+    # Шаг 1: убрать здания вне зоны
     valid_buildings = []
     removed = 0
     for b in massing.get("buildings", []):
@@ -264,7 +365,31 @@ def clip_massing_to_buildable(massing: dict, site_data: dict, config: dict) -> d
             print(f"    Удалено здание {b['id']} (overlap {overlap*100:.0f}%)")
 
     if removed:
-        print(f"    Итого удалено: {removed} зданий")
+        print(f"    Удалено вне зоны: {removed}")
+
+    # Шаг 2: убрать пересекающиеся (оставляем здание с большей площадью)
+    kept = []
+    for b in valid_buildings:
+        fp = Polygon(b["footprint"])
+        conflict = False
+        for k in kept:
+            kfp = Polygon(k["footprint"])
+            if fp.distance(kfp) < fire_dist:
+                # Конфликт — оставляем большее
+                if b.get("sellable_area", 0) <= k.get("sellable_area", 0):
+                    conflict = True
+                    print(f"    Удалено здание {b['id']} (конфликт с {k['id']}, dist={fp.distance(kfp):.1f}м)")
+                    break
+                else:
+                    kept.remove(k)
+                    print(f"    Удалено здание {k['id']} (конфликт с {b['id']}, меньше площадь)")
+        if not conflict:
+            kept.append(b)
+
+    if len(kept) < len(valid_buildings):
+        print(f"    Удалено пересечений: {len(valid_buildings) - len(kept)}")
+
+    valid_buildings = kept
 
     massing["buildings"] = valid_buildings
     # Обновляем summary
@@ -461,11 +586,15 @@ def main():
         print(f"  Размеры: {site_data['width']} x {site_data['height']} м")
         print(f"  Найдено полигонов: {site_data['all_polygons_count']}")
 
+        # Генерация слотов для зданий
+        print("\nГенерация слотов...")
+        slots = generate_building_slots(site_data, config)
+
         # Генерация массинга
         prev_errors = []
         for attempt in range(1, args.max_retries + 1):
             print(f"\nГенерация массинга (попытка {attempt}/{args.max_retries})...")
-            prompt = build_prompt(site_data, config)
+            prompt = build_prompt(site_data, config, slots=slots if slots else None)
             if prev_errors:
                 prompt += "\n\n## ОШИБКИ ПРЕДЫДУЩЕЙ ПОПЫТКИ (исправь их!)\n"
                 for err in prev_errors:
