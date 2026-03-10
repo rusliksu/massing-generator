@@ -175,6 +175,41 @@ def parse_existing_buildings(dxf_path: str, scale: float = 1.0) -> list[dict]:
     return buildings
 
 
+def parse_cadastral_parcels(dxf_path: str, scale: float = 1.0) -> list[dict]:
+    """Извлекает кадастровые участки из DXF (слои p_*)."""
+    from shapely.affinity import scale as shapely_scale
+
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+
+    parcels = []
+    for entity in msp:
+        if entity.dxftype() != "LWPOLYLINE" or not entity.closed:
+            continue
+        if not entity.dxf.layer.lower().startswith("p_"):
+            continue
+
+        points = [(p[0], p[1]) for p in entity.get_points()]
+        if len(points) < 3:
+            continue
+
+        poly = Polygon(points)
+        if poly.area <= 0:
+            continue
+
+        poly_scaled = shapely_scale(poly, xfact=scale, yfact=scale, origin=(0, 0))
+        area = poly_scaled.area
+
+        if area > 500:  # только участки > 500 м² (не постройки)
+            parcels.append({
+                "layer": entity.dxf.layer,
+                "polygon": poly_scaled,
+                "area_m2": round(area, 1),
+            })
+
+    return parcels
+
+
 def parse_roads(dxf_path: str, scale: float = 1.0) -> list[Polygon]:
     """
     Извлекает дороги из DXF (слой ГП Дорога и похожие).
@@ -1171,7 +1206,7 @@ def write_massing_to_dxf(massing: dict, site_data: dict, output_path: str):
     print(f"DXF сохранён: {output_path}")
 
 
-def visualize_massing(massing: dict, site_data: dict, output_path: str = None):
+def visualize_massing(massing: dict, site_data: dict, output_path: str = None, config: dict = None):
     """Визуализация массинга через matplotlib."""
     import matplotlib
     matplotlib.use("Agg")
@@ -1205,6 +1240,14 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None):
     if site_data.get("existing_buildings"):
         ax.plot([], [], color='gray', linewidth=5, alpha=0.5, label=f'Существующие ({len(site_data["existing_buildings"])})')
 
+    # Кадастровые участки (зелёный пунктир, тонкий)
+    for parcel in site_data.get("parcels", []):
+        px, py = parcel["polygon"].exterior.xy
+        ax.plot(px, py, color='green', linewidth=0.6, linestyle=':', alpha=0.4)
+    if site_data.get("parcels"):
+        ax.plot([], [], color='green', linewidth=1, linestyle=':', alpha=0.5,
+                label=f'Кадастр ({len(site_data["parcels"])})')
+
     # Дороги (светло-коричневые)
     for road in site_data.get("roads", []):
         if road.geom_type == 'Polygon':
@@ -1212,6 +1255,19 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None):
             ax.fill(rx, ry, facecolor='wheat', edgecolor='tan', linewidth=0.5, alpha=0.4)
     if site_data.get("roads"):
         ax.plot([], [], color='wheat', linewidth=5, alpha=0.5, label=f'Дороги ({len(site_data["roads"])})')
+
+    # Тени от зданий (полдень, 22 марта)
+    latitude = config.get("site", {}).get("latitude", 54.6) if config else 54.6
+    az_noon, alt_noon = compute_sun_position(latitude, 12.0)
+    if alt_noon > 2:
+        for b in massing.get("buildings", []):
+            height = b.get("total_height", b.get("floors", 15) * b.get("floor_height", 3.0))
+            shadow = compute_shadow_polygon(b["footprint"], height, az_noon, alt_noon)
+            if shadow.is_valid and shadow.area > 0:
+                if shadow.geom_type == 'Polygon':
+                    sx, sy = shadow.exterior.xy
+                    ax.fill(sx, sy, facecolor='navy', alpha=0.08)
+        ax.plot([], [], color='navy', linewidth=5, alpha=0.15, label='Тени (12:00, 22 марта)')
 
     # Здания
     colors_by_block = {}
@@ -1243,11 +1299,24 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None):
                 fontsize=6, fontweight='bold')
 
     ax.set_aspect('equal')
-    ax.set_title(f"Массинг v5 — {massing.get('summary', {}).get('total_buildings', '?')} зданий, "
-                 f"{massing.get('summary', {}).get('total_sellable_area', '?')} м²",
+
+    summary = massing.get("summary", {})
+    ax.set_title(f"Массинг — {summary.get('total_buildings', '?')} зданий, "
+                 f"{summary.get('total_sellable_area', '?')} м²",
                  fontsize=14)
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3)
+
+    # Сводная таблица внизу
+    info_parts = [
+        f"Плотность: {summary.get('density', '?')}",
+        f"Покрытие: {summary.get('site_coverage_ratio', '?')}",
+    ]
+    if summary.get("est_apartments"):
+        info_parts.append(f"~{summary['est_apartments']} кв.")
+        info_parts.append(f"~{summary.get('est_parking_spots', '?')} м/м")
+        info_parts.append(f"~{summary.get('est_residents', '?')} жит.")
+    fig.text(0.5, 0.01, " | ".join(info_parts), ha='center', fontsize=9, color='gray')
 
     if output_path:
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -1310,12 +1379,14 @@ def main():
         print(f"  Размеры: {site_data['width']} x {site_data['height']} м")
         print(f"  Найдено полигонов: {site_data['all_polygons_count']}")
 
-        # Парсинг существующих зданий и дорог
+        # Парсинг существующих зданий, дорог, кадастровых участков
         print("\nПарсинг контекста участка...")
         existing_buildings = parse_existing_buildings(dxf_path, scale=args.scale)
         roads = parse_roads(dxf_path, scale=args.scale)
+        parcels = parse_cadastral_parcels(dxf_path, scale=args.scale)
         print(f"  Существующие здания: {len(existing_buildings)}")
         print(f"  Дороги: {len(roads)}")
+        print(f"  Кадастровые участки: {len(parcels)}")
         if existing_buildings:
             total_existing = sum(b["area_m2"] for b in existing_buildings)
             print(f"  Общая площадь существующей застройки: {total_existing:.0f} м²")
@@ -1323,6 +1394,7 @@ def main():
         # Сохраняем в site_data для доступа из других функций
         site_data["existing_buildings"] = existing_buildings
         site_data["roads"] = roads
+        site_data["parcels"] = parcels
 
         # Генерация кварталов
         print("\nГенерация кварталов...")
@@ -1385,6 +1457,18 @@ def main():
         print(f"  Финальный результат: {summary.get('total_buildings', 0)} зданий, "
               f"{summary.get('total_sellable_area', 0)} м² продаваемой площади")
 
+        # Расчёт квартир и паркинга
+        total_sell = summary.get("total_sellable_area", 0)
+        avg_apartment_m2 = 55  # средняя квартира ~55 м²
+        est_apartments = round(total_sell / avg_apartment_m2) if total_sell else 0
+        est_parking = round(est_apartments * 0.7)  # 0.7 м/м по нормам
+        est_residents = round(est_apartments * 2.3)  # 2.3 чел/квартиру
+        summary["est_apartments"] = est_apartments
+        summary["est_parking_spots"] = est_parking
+        summary["est_residents"] = est_residents
+        print(f"  Расчётные квартиры: ~{est_apartments} (ср. {avg_apartment_m2} м²)")
+        print(f"  Паркинг: ~{est_parking} м/м | Жители: ~{est_residents} чел.")
+
         # Проверка инсоляции
         print("\nПроверка инсоляции (22 марта, СанПиН)...")
         insol_violations = check_insolation(massing, config)
@@ -1415,7 +1499,7 @@ def main():
         viz_path = input_path.parent / "test_output" / "massing_v5.png"
         viz_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            visualize_massing(massing, site_data, str(viz_path))
+            visualize_massing(massing, site_data, str(viz_path), config=config)
         except Exception as e:
             print(f"  Визуализация не удалась: {e}")
 
