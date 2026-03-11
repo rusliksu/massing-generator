@@ -261,7 +261,7 @@ def compute_buildable_area(site_data: dict, config: dict,
     site_polygon = Polygon(site_data["coordinates"])
     setback = config.get("setbacks", {}).get("default", 6)
     road_setback = config.get("setbacks", {}).get("road", 10)
-    buildable = site_polygon.buffer(-setback)
+    buildable = site_polygon.buffer(-setback, join_style='mitre', mitre_limit=2.0)
 
     # Берём из site_data если не переданы явно
     if existing_buildings is None:
@@ -308,21 +308,165 @@ def compute_buildable_area(site_data: dict, config: dict,
 
 def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: float,
                            seed: int = None, n_variants: int = 30) -> list[dict]:
-    """Grid-фоллбэк для участков без кадастровых парселей.
-    Пробует n_variants раскладок, выбирает лучшую по суммарной площади.
-    seed — для воспроизводимости. Если None, результат будет случайным."""
+    """Квартальная раскладка: разбивает участок на блоки с проездами,
+    внутри каждого блока размещает 2-4 здания параллельными рядами.
+    seed — для воспроизводимости."""
     import numpy as np
-    from shapely.geometry import box, Point
-    from shapely.affinity import rotate
+    from shapely.geometry import box, Point, LineString
+    from shapely.affinity import rotate, translate
     import random
 
     rng = random.Random(seed)
+    area = buildable.area
+
+    # Для маленьких участков (<1 га) — простая раскладка без кварталов
+    if area < 10000:
+        return _generate_small_site_layout(config, buildable, main_angle, rng)
+
+    # Параметры квартала (блок = П-образный или замкнутый двор)
+    #
+    #   ══════════════════   длинный корпус (~60м x 13м)
+    #   ║                ║
+    #   ║     ДВОР       ║   торцевые корпуса (~24м x 13м)
+    #   ║                ║
+    #   ══════════════════   длинный корпус (~60м x 13м)
+    #
+    ROAD_WIDTH = 8        # пожарный проезд между кварталами (м)
+    DEPTH = 13            # глубина корпуса (м)
+    COURTYARD_W = 35      # ширина двора (между длинными корпусами) (м)
+    LONG_LEN = 60         # длина длинного корпуса (м)
+    SHORT_LEN = 24        # длина торцевого корпуса (≈ COURTYARD_W - зазоры)
+    FIRE_GAP = 12         # пожарный разрыв (м)
+
+    # Габарит одного квартала
+    block_w = LONG_LEN                          # вдоль main_angle
+    block_h = COURTYARD_W + 2 * DEPTH           # поперёк
+
+    rad = np.radians(main_angle)
+    cos_a, sin_a = np.cos(rad), np.sin(rad)
+    cos_p, sin_p = -sin_a, cos_a
+
+    cx, cy = buildable.centroid.x, buildable.centroid.y
+    span = area ** 0.5 * 1.2
+
+    step_long = block_w + ROAD_WIDTH
+    step_across = block_h + ROAD_WIDTH
+
+    n_long = int(span / step_long) + 1
+    n_across = int(span / step_across) + 1
+
+    def _make_block(qx, qy):
+        """Создаёт квартал из 3-4 зданий вокруг двора. Возвращает список или None."""
+        half_court = COURTYARD_W / 2
+        half_long = LONG_LEN / 2
+        blds = []
+
+        # 2 длинных параллельных корпуса
+        for side in [-1, 1]:
+            px = qx + side * (half_court + DEPTH / 2) * cos_p
+            py = qy + side * (half_court + DEPTH / 2) * sin_p
+            hw, hd = half_long, DEPTH / 2
+            fp = box(px - hw, py - hd, px + hw, py + hd)
+            fp_rot = rotate(fp, main_angle, origin=(px, py))
+            blds.append({'poly': fp_rot, 'cx': px, 'cy': py,
+                         'coords': list(fp_rot.exterior.coords)[:-1],
+                         'area': fp_rot.area, 'len': LONG_LEN})
+
+        # 2 торцевых (перпендикулярных) корпуса — замыкают двор
+        for end in [-1, 1]:
+            px = qx + end * (half_long - DEPTH / 2) * cos_a
+            py = qy + end * (half_long - DEPTH / 2) * sin_a
+            hw, hd = SHORT_LEN / 2, DEPTH / 2
+            fp = box(px - hw, py - hd, px + hw, py + hd)
+            fp_rot = rotate(fp, main_angle + 90, origin=(px, py))
+            blds.append({'poly': fp_rot, 'cx': px, 'cy': py,
+                         'coords': list(fp_rot.exterior.coords)[:-1],
+                         'area': fp_rot.area, 'len': SHORT_LEN})
+
+        return blds
+
+    best_buildings = []
+    best_total = 0
+
+    for attempt in range(n_variants):
+        offset_long = rng.uniform(-step_long / 2, step_long / 2)
+        offset_across = rng.uniform(-step_across / 2, step_across / 2)
+
+        placed = []
+        placed_polys = []
+
+        for bi in range(-n_long, n_long + 1):
+            for bj in range(-n_across, n_across + 1):
+                qx = cx + (bi * step_long + offset_long) * cos_a \
+                         + (bj * step_across + offset_across) * cos_p
+                qy = cy + (bi * step_long + offset_long) * sin_a \
+                         + (bj * step_across + offset_across) * sin_p
+
+                block = _make_block(qx, qy)
+
+                # Проверяем ВСЕ здания блока: внутри зоны + не пересекают уже размещённые
+                block_ok = True
+                for b in block:
+                    if not buildable.contains(b['poly']):
+                        block_ok = False
+                        break
+                    for ep in placed_polys:
+                        if ep.distance(b['poly']) < FIRE_GAP:
+                            block_ok = False
+                            break
+                    if not block_ok:
+                        break
+
+                if not block_ok:
+                    # Попробуем хотя бы 2 длинных (П-образный двор без одного торца)
+                    partial = block[:2]  # только длинные
+                    partial_ok = True
+                    for b in partial:
+                        if not buildable.contains(b['poly']):
+                            partial_ok = False
+                            break
+                        for ep in placed_polys:
+                            if ep.distance(b['poly']) < FIRE_GAP:
+                                partial_ok = False
+                                break
+                        if not partial_ok:
+                            break
+                    if partial_ok:
+                        for b in partial:
+                            placed.append(b)
+                            placed_polys.append(b['poly'])
+                    continue
+
+                for b in block:
+                    placed.append(b)
+                    placed_polys.append(b['poly'])
+
+        total = sum(o['area'] for o in placed)
+        if total > best_total:
+            best_total = total
+            best_buildings = placed
+
+    # Финализация
+    buildings = _finalize_buildings(best_buildings, rng)
+    print(f"  Размещено {len(buildings)} зданий (квартальная сетка, "
+          f"лучшая из {n_variants} попыток, seed={seed})")
+    return buildings
+
+
+def _generate_small_site_layout(config: dict, buildable, main_angle: float,
+                                 rng) -> list[dict]:
+    """Раскладка для маленьких участков (<1 га): перебор пар/троек."""
+    import numpy as np
+    from shapely.geometry import box, Point
+    from shapely.affinity import rotate
 
     cx, cy = buildable.centroid.x, buildable.centroid.y
     area = buildable.area
-    step = max(6, min(12, area ** 0.5 / 8))
+    step = max(6, min(10, area ** 0.5 / 8))
+    DEPTH = 13
+    FIRE_GAP = 12
 
-    # Генерируем все кандидатные позиции
+    # Кандидатные позиции
     candidates = []
     span = area ** 0.5
     for dx in np.arange(-span, span + 1, step):
@@ -333,14 +477,13 @@ def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: 
             if buildable.contains(Point(x, y)):
                 candidates.append((x, y))
 
-    # Предвычисляем все возможные здания (позиция + макс размер)
+    # Все возможные здания
     all_options = []
-    depth = 13  # фиксированная глубина корпуса
     for x, y in candidates:
         for angle_offset in [0, 90]:
             angle = main_angle + angle_offset
-            for b_len in [100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20]:
-                hw, hd = b_len / 2, depth / 2
+            for b_len in [80, 70, 60, 50, 45, 40, 35, 30, 25, 20]:
+                hw, hd = b_len / 2, DEPTH / 2
                 fp = box(x - hw, y - hd, x + hw, y + hd)
                 fp_rot = rotate(fp, angle, origin=(x, y))
                 if buildable.contains(fp_rot):
@@ -351,66 +494,47 @@ def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: 
                         'cx': x, 'cy': y,
                         'len': b_len,
                     })
-                    break  # берём максимальный размер для этой позиции+угла
+                    break
 
-    # Ищем лучшую комбинацию: перебираем пары/тройки
+    # Перебор: лучшее одиночное → лучшая пара → лучшая тройка
     best = []
     best_area = 0
 
-    # Для малого числа вариантов — полный перебор пар
-    if len(all_options) <= 100:
-        # Лучшее одиночное
-        for opt in all_options:
-            if opt['area'] > best_area:
-                best_area = opt['area']
-                best = [opt]
+    for opt in all_options:
+        if opt['area'] > best_area:
+            best_area = opt['area']
+            best = [opt]
 
-        # Лучшая пара
+    if len(all_options) <= 150:
         for i in range(len(all_options)):
             for j in range(i + 1, len(all_options)):
                 a, b = all_options[i], all_options[j]
-                if a['poly'].distance(b['poly']) < 12:
+                if a['poly'].distance(b['poly']) < FIRE_GAP:
                     continue
                 total = a['area'] + b['area']
                 if total > best_area:
                     best_area = total
                     best = [a, b]
 
-        # Лучшая тройка (на базе лучшей пары)
         if len(best) == 2:
             for k in range(len(all_options)):
                 c = all_options[k]
-                if any(c['poly'].distance(b['poly']) < 12 for b in best):
+                if any(c['poly'].distance(b['poly']) < FIRE_GAP for b in best):
                     continue
                 total = best_area + c['area']
                 if total > best_area:
                     best_area = total
                     best = best + [c]
-    else:
-        # Для большого числа — жадный с перемешиванием
-        for attempt in range(n_variants):
-            shuffled = all_options[:]
-            rng.shuffle(shuffled)
-            placed = []
-            placed_polys = []
-            for opt in shuffled:
-                ok = True
-                for ep in placed_polys:
-                    if ep.distance(opt['poly']) < 12:
-                        ok = False
-                        break
-                if not ok:
-                    continue
-                placed.append(opt)
-                placed_polys.append(opt['poly'])
-            total = sum(o['area'] for o in placed)
-            if total > best_area:
-                best_area = total
-                best = placed
 
-    # Финализируем лучшую раскладку
+    buildings = _finalize_buildings(best, rng)
+    print(f"  Размещено {len(buildings)} зданий (малый участок)")
+    return buildings
+
+
+def _finalize_buildings(placed: list[dict], rng) -> list[dict]:
+    """Преобразует внутренний формат зданий в выходной."""
     buildings = []
-    for i, b in enumerate(best, 1):
+    for i, b in enumerate(placed, 1):
         fp_area = b['area']
         if fp_area > 1000:
             floors = rng.randint(16, 25)
@@ -427,8 +551,6 @@ def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: 
             'cx': round(b['cx'], 1),
             'cy': round(b['cy'], 1),
         })
-
-    print(f"  Размещено {len(buildings)} зданий (grid, лучшая из {n_variants} попыток, seed={seed})")
     return buildings
 
 
