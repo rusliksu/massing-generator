@@ -306,7 +306,189 @@ def compute_buildable_area(site_data: dict, config: dict,
     }
 
 
-def generate_parcel_based_layout(site_data: dict, config: dict) -> list[dict]:
+def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: float,
+                           seed: int = None, n_variants: int = 30) -> list[dict]:
+    """Grid-фоллбэк для участков без кадастровых парселей.
+    Пробует n_variants раскладок, выбирает лучшую по суммарной площади.
+    seed — для воспроизводимости. Если None, результат будет случайным."""
+    import numpy as np
+    from shapely.geometry import box, Point
+    from shapely.affinity import rotate
+    import random
+
+    rng = random.Random(seed)
+
+    cx, cy = buildable.centroid.x, buildable.centroid.y
+    area = buildable.area
+    step = max(6, min(12, area ** 0.5 / 8))
+
+    # Генерируем все кандидатные позиции
+    candidates = []
+    span = area ** 0.5
+    for dx in np.arange(-span, span + 1, step):
+        for dy in np.arange(-span, span + 1, step):
+            rad = np.radians(main_angle)
+            x = cx + dx * np.cos(rad) - dy * np.sin(rad)
+            y = cy + dx * np.sin(rad) + dy * np.cos(rad)
+            if buildable.contains(Point(x, y)):
+                candidates.append((x, y))
+
+    # Предвычисляем все возможные здания (позиция + макс размер)
+    all_options = []
+    depth = 13  # фиксированная глубина корпуса
+    for x, y in candidates:
+        for angle_offset in [0, 90]:
+            angle = main_angle + angle_offset
+            for b_len in [100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20]:
+                hw, hd = b_len / 2, depth / 2
+                fp = box(x - hw, y - hd, x + hw, y + hd)
+                fp_rot = rotate(fp, angle, origin=(x, y))
+                if buildable.contains(fp_rot):
+                    all_options.append({
+                        'poly': fp_rot,
+                        'coords': list(fp_rot.exterior.coords)[:-1],
+                        'area': fp_rot.area,
+                        'cx': x, 'cy': y,
+                        'len': b_len,
+                    })
+                    break  # берём максимальный размер для этой позиции+угла
+
+    # Ищем лучшую комбинацию: перебираем пары/тройки
+    best = []
+    best_area = 0
+
+    # Для малого числа вариантов — полный перебор пар
+    if len(all_options) <= 100:
+        # Лучшее одиночное
+        for opt in all_options:
+            if opt['area'] > best_area:
+                best_area = opt['area']
+                best = [opt]
+
+        # Лучшая пара
+        for i in range(len(all_options)):
+            for j in range(i + 1, len(all_options)):
+                a, b = all_options[i], all_options[j]
+                if a['poly'].distance(b['poly']) < 12:
+                    continue
+                total = a['area'] + b['area']
+                if total > best_area:
+                    best_area = total
+                    best = [a, b]
+
+        # Лучшая тройка (на базе лучшей пары)
+        if len(best) == 2:
+            for k in range(len(all_options)):
+                c = all_options[k]
+                if any(c['poly'].distance(b['poly']) < 12 for b in best):
+                    continue
+                total = best_area + c['area']
+                if total > best_area:
+                    best_area = total
+                    best = best + [c]
+    else:
+        # Для большого числа — жадный с перемешиванием
+        for attempt in range(n_variants):
+            shuffled = all_options[:]
+            rng.shuffle(shuffled)
+            placed = []
+            placed_polys = []
+            for opt in shuffled:
+                ok = True
+                for ep in placed_polys:
+                    if ep.distance(opt['poly']) < 12:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                placed.append(opt)
+                placed_polys.append(opt['poly'])
+            total = sum(o['area'] for o in placed)
+            if total > best_area:
+                best_area = total
+                best = placed
+
+    # Финализируем лучшую раскладку
+    buildings = []
+    for i, b in enumerate(best, 1):
+        fp_area = b['area']
+        if fp_area > 1000:
+            floors = rng.randint(16, 25)
+        elif fp_area > 500:
+            floors = rng.randint(12, 20)
+        else:
+            floors = rng.randint(9, 16)
+        buildings.append({
+            'id': i,
+            'footprint': [[round(c[0], 1), round(c[1], 1)] for c in b['coords']],
+            'area_m2': round(fp_area, 0),
+            'floors': floors,
+            'shape': 'rect',
+            'cx': round(b['cx'], 1),
+            'cy': round(b['cy'], 1),
+        })
+
+    print(f"  Размещено {len(buildings)} зданий (grid, лучшая из {n_variants} попыток, seed={seed})")
+    return buildings
+
+
+def compute_summary(buildings: list[dict], site_data: dict) -> dict:
+    """Вычисляет сводку: площади, квартиры, машиноместа, жители."""
+    site_poly = Polygon(site_data["coordinates"])
+    total_footprint = sum(b.get('area_m2', 0) for b in buildings)
+    total_sellable = 0
+    total_apartments = 0
+
+    for b in buildings:
+        fp_area = b.get('area_m2', 0)
+        floors = b.get('floors', 10)
+        gross = fp_area * floors
+        sellable = gross * 0.75  # ~75% продаваемая (минус МОП, лестницы, стены)
+        apartments = int(sellable / 55)  # средняя квартира ~55 м²
+        total_sellable += sellable
+        total_apartments += apartments
+
+    total_residents = int(total_apartments * 2.3)
+    parking = total_apartments  # 1 м/м на квартиру (СП 42.13330)
+    coverage = total_footprint / site_poly.area if site_poly.area > 0 else 0
+
+    return {
+        'total_buildings': len(buildings),
+        'total_sellable_area': f'{total_sellable:.0f}',
+        'total_footprint': f'{total_footprint:.0f}',
+        'density': f'{coverage:.1%}',
+        'site_coverage_ratio': f'{coverage:.1%}',
+        'est_apartments': total_apartments,
+        'est_parking_spots': parking,
+        'est_residents': total_residents,
+    }
+
+
+def generate_variants(site_data: dict, config: dict, n_seeds: int = 5,
+                      n_variants_per_seed: int = 30) -> list[dict]:
+    """Генерирует несколько вариантов раскладки с разными seed'ами.
+    Возвращает список: [{'seed': int, 'buildings': [...], 'summary': {...}, 'total_area': float}]
+    отсортированный по total_area (лучший первый)."""
+    results = []
+    for s in range(n_seeds):
+        buildings = generate_parcel_based_layout(
+            site_data, config, seed=s, n_variants=n_variants_per_seed)
+        summary = compute_summary(buildings, site_data)
+        total_area = sum(b.get('area_m2', 0) * b.get('floors', 1) for b in buildings)
+        results.append({
+            'seed': s,
+            'buildings': buildings,
+            'summary': summary,
+            'total_area': total_area,
+        })
+    results.sort(key=lambda r: r['total_area'], reverse=True)
+    print(f"  Сгенерировано {n_seeds} вариантов. Лучший: seed={results[0]['seed']}, "
+          f"площадь={results[0]['total_area']:.0f}м²")
+    return results
+
+
+def generate_parcel_based_layout(site_data: dict, config: dict,
+                                  seed: int = None, n_variants: int = 30) -> list[dict]:
     """
     Генерирует раскладку зданий по кадастровым участкам.
     Каждый участок получает одно здание, вписанное внутрь с отступами.
@@ -318,9 +500,6 @@ def generate_parcel_based_layout(site_data: dict, config: dict) -> list[dict]:
     import random
 
     parcels = site_data.get("parcels", [])
-    if not parcels:
-        print("  Нет кадастровых участков — фоллбэк на кварталы")
-        return []
 
     # Определяем угол участка для ориентации зданий
     site_poly = Polygon(site_data["coordinates"])
@@ -336,6 +515,17 @@ def generate_parcel_based_layout(site_data: dict, config: dict) -> list[dict]:
     buildable_info = compute_buildable_area(site_data, config)
     buildable = buildable_info["polygon"]
 
+    if not parcels:
+        print("  Нет кадастровых участков — grid-фоллбэк")
+        return _generate_grid_layout(site_data, config, buildable, main_angle,
+                                     seed=seed, n_variants=n_variants)
+
+    # Собираем полигоны существующих зданий для проверки зазора
+    existing_polys = [eb["polygon"] for eb in site_data.get("existing_buildings", [])]
+
+    # Собираем дороги для проверки пересечений
+    road_polys = site_data.get("roads", [])
+
     buildings = []
     building_id = 1
 
@@ -344,41 +534,13 @@ def generate_parcel_based_layout(site_data: dict, config: dict) -> list[dict]:
         area = parcel["area_m2"]
 
         # Пропускаем слишком маленькие участки
-        if area < 500:
+        if area < 300:
             continue
 
-        # Участок должен быть внутри buildable зоны хотя бы на 50%
-        if buildable.intersection(pp).area / pp.area < 0.5:
+        # Участок должен хотя бы частично пересекаться с зоной застройки
+        parcel_in_buildable = buildable.intersection(pp).area / pp.area if pp.area > 0 else 0
+        if parcel_in_buildable < 0.15:
             continue
-
-        # Для больших участков (>8000 м²) — делим на sub-зоны и ставим несколько зданий
-        if area > 8000:
-            from shapely.ops import split
-            from shapely.geometry import LineString
-
-            # Разбиваем пополам по длинной оси
-            p_mrr = pp.minimum_rotated_rectangle
-            pc = list(p_mrr.exterior.coords)
-            pe1_len = np.linalg.norm(np.array(pc[1]) - np.array(pc[0]))
-            pe2_len = np.linalg.norm(np.array(pc[2]) - np.array(pc[1]))
-            if pe1_len > pe2_len:
-                mid1 = ((pc[0][0] + pc[3][0]) / 2, (pc[0][1] + pc[3][1]) / 2)
-                mid2 = ((pc[1][0] + pc[2][0]) / 2, (pc[1][1] + pc[2][1]) / 2)
-            else:
-                mid1 = ((pc[0][0] + pc[1][0]) / 2, (pc[0][1] + pc[1][1]) / 2)
-                mid2 = ((pc[2][0] + pc[3][0]) / 2, (pc[2][1] + pc[3][1]) / 2)
-
-            # Добавляем sub-parcels обратно в список для обработки
-            try:
-                cut_line = LineString([mid1, mid2]).buffer(0.5)
-                sub = pp.difference(cut_line)
-                if sub.geom_type == 'MultiPolygon':
-                    for sp in sub.geoms:
-                        if sp.area > 500:
-                            parcels.append({"polygon": sp, "area_m2": round(sp.area, 1), "layer": parcel.get("layer", "split")})
-                    continue
-            except Exception:
-                pass  # если не получилось разбить — ставим одно здание
 
         cx, cy = pp.centroid.x, pp.centroid.y
 
@@ -390,68 +552,228 @@ def generate_parcel_based_layout(site_data: dict, config: dict) -> list[dict]:
         p_long = max(pe1, pe2)
         p_short = min(pe1, pe2)
 
-        # Отступ от границ участка (6м)
-        setback = 6
+        # Отступ от границ участка (5м — минимальный от границы)
+        setback = 5
         avail_long = p_long - setback * 2
         avail_short = p_short - setback * 2
 
         if avail_long < 20 or avail_short < 10:
             continue  # слишком маленький для здания
 
-        # Глубина корпуса 12-18м (жилой дом)
-        depth = min(18, avail_short * 0.75)
-        depth = max(12, depth)
+        # Глубина корпуса 12-14м (секционный жилой дом, как у Ильи: avg 12м)
+        depth = random.uniform(12, 14)
         if depth > avail_short:
-            depth = avail_short
+            depth = max(10, avail_short)
 
-        # Выбираем форму здания по размеру участка
-        if area > 4000 and avail_long > 60:
-            # Большой участок — Н-образное (два крыла + перемычка)
-            shape_type = random.choices(["h_shape", "rect", "l_shape"], weights=[50, 30, 20], k=1)[0]
-        elif area > 2000:
+        # Большие участки — несколько зданий вдоль длинной оси
+        # На широких участках первое здание может быть H/L
+        if area > 2500 and avail_long > 55:
+            num_buildings = min(max(2, int(avail_long / 60)), 4)
+            if num_buildings >= 2:
+                # Определяем направление длинной оси участка
+                p_mrr2 = pp.minimum_rotated_rectangle
+                pc2 = list(p_mrr2.exterior.coords)
+                pe1v = np.array(pc2[1]) - np.array(pc2[0])
+                pe2v = np.array(pc2[2]) - np.array(pc2[1])
+                if np.linalg.norm(pe1v) > np.linalg.norm(pe2v):
+                    axis = pe1v / np.linalg.norm(pe1v)
+                else:
+                    axis = pe2v / np.linalg.norm(pe2v)
+
+                # Размещаем здания вдоль оси с шагом
+                spacing = avail_long / num_buildings
+                start_offset = -(num_buildings - 1) * spacing / 2
+
+                multi_placed = 0
+                for k in range(num_buildings):
+                    offset = start_offset + k * spacing
+                    bx = cx + axis[0] * offset
+                    by = cy + axis[1] * offset
+
+                    # Первое здание на широком участке (short > 40м) — может быть H/L
+                    is_wide = avail_short > 40
+                    if k == 0 and is_wide and random.random() < 0.5:
+                        sub_shape = random.choices(["h_shape", "l_shape"], weights=[50, 50], k=1)[0]
+                        if sub_shape == "h_shape":
+                            sub_len = min(spacing * 0.85, 80)
+                            sub_depth = min(60, max(40, sub_len * random.uniform(0.6, 0.85)))
+                        else:
+                            sub_len = min(spacing * 0.85, 55)
+                            sub_depth = min(45, max(30, sub_len * random.uniform(0.7, 0.95)))
+                    else:
+                        sub_shape = "rect"
+                        sub_len = min(spacing * 0.80, 100)
+                        sub_len = max(40, sub_len)
+                        sub_depth = random.uniform(12, 14)
+                    sub_hw, sub_hd = sub_len / 2, sub_depth / 2
+
+                    if sub_shape == "h_shape" and sub_len > 35:
+                        wing_r = random.uniform(0.30, 0.42)
+                        wing_l = sub_len * wing_r
+                        conn_d2 = sub_depth * random.uniform(0.30, 0.50)
+                        sub_fp = Polygon([
+                            (bx - sub_hw, by - sub_hd),
+                            (bx - sub_hw + wing_l, by - sub_hd),
+                            (bx - sub_hw + wing_l, by - conn_d2 / 2),
+                            (bx + sub_hw - wing_l, by - conn_d2 / 2),
+                            (bx + sub_hw - wing_l, by - sub_hd),
+                            (bx + sub_hw, by - sub_hd),
+                            (bx + sub_hw, by + sub_hd),
+                            (bx + sub_hw - wing_l, by + sub_hd),
+                            (bx + sub_hw - wing_l, by + conn_d2 / 2),
+                            (bx - sub_hw + wing_l, by + conn_d2 / 2),
+                            (bx - sub_hw + wing_l, by + sub_hd),
+                            (bx - sub_hw, by + sub_hd),
+                        ])
+                    elif sub_shape == "u_shape" and sub_len > 35:
+                        wing_d2 = sub_depth
+                        base_d2 = sub_depth * random.uniform(0.35, 0.50)
+                        sub_fp = Polygon([
+                            (bx - sub_hw, by - sub_hd),
+                            (bx + sub_hw, by - sub_hd),
+                            (bx + sub_hw, by + sub_hd),
+                            (bx + sub_hw - wing_d2, by + sub_hd),
+                            (bx + sub_hw - wing_d2, by - sub_hd + base_d2),
+                            (bx - sub_hw + wing_d2, by - sub_hd + base_d2),
+                            (bx - sub_hw + wing_d2, by + sub_hd),
+                            (bx - sub_hw, by + sub_hd),
+                        ])
+                    elif sub_shape == "l_shape" and sub_len > 30:
+                        wr = random.uniform(0.35, 0.55)
+                        wdr = random.uniform(0.30, 0.50)
+                        sub_fp = Polygon([
+                            (bx - sub_hw, by - sub_hd),
+                            (bx - sub_hw + sub_len * wr, by - sub_hd),
+                            (bx - sub_hw + sub_len * wr, by - sub_hd + sub_depth * wdr),
+                            (bx + sub_hw, by - sub_hd + sub_depth * wdr),
+                            (bx + sub_hw, by + sub_hd),
+                            (bx - sub_hw, by + sub_hd),
+                        ])
+                    else:
+                        sub_fp = box(bx - sub_hw, by - sub_hd, bx + sub_hw, by + sub_hd)
+
+                    # Поворот по оси участка (с 40% шансом перпендикулярно)
+                    sub_angle = main_angle + (90 if random.random() < 0.4 else 0)
+                    sub_fp_rot = rotate(sub_fp, sub_angle, origin=(bx, by))
+
+                    # Фикс невалидной геометрии
+                    if not sub_fp_rot.is_valid:
+                        sub_fp_rot = sub_fp_rot.buffer(0)
+                    if sub_fp_rot.area == 0:
+                        continue
+                    # Здание должно полностью влезать в зону застройки
+                    if not buildable.contains(sub_fp_rot):
+                        continue
+                    # Проверка: пожарные разрывы 12м
+                    ok = True
+                    for existing in buildings:
+                        if Polygon(existing["footprint"]).distance(sub_fp_rot) < 12:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+
+                    coords = list(sub_fp_rot.exterior.coords)[:-1]
+                    sub_area = sub_fp_rot.area
+                    if sub_area > 1000:
+                        sf = random.randint(12, 20)
+                    elif sub_area > 500:
+                        sf = random.randint(9, 16)
+                    else:
+                        sf = random.randint(5, 12)
+                    buildings.append({
+                        "id": building_id,
+                        "footprint": [[round(c[0], 1), round(c[1], 1)] for c in coords],
+                        "area_m2": round(sub_area, 0),
+                        "floors": sf,
+                        "shape": sub_shape,
+                        "parcel_area": round(area / num_buildings, 0),
+                        "orientation_deg": round(sub_angle, 1),
+                        "cx": round(bx, 1),
+                        "cy": round(by, 1),
+                    })
+                    building_id += 1
+                    multi_placed += 1
+
+                if multi_placed > 0:
+                    continue  # уже разместили, не ставить одиночное
+
+        # Выбираем форму (как у Ильи: rect 67%, L 12%, H 8%, complex 12%)
+        # H и L только если участок достаточно широкий (short > 25м)
+        if avail_short > 25 and area > 3000:
             shape_type = random.choices(["rect", "l_shape", "h_shape"], weights=[50, 30, 20], k=1)[0]
+        elif avail_short > 20 and area > 2000:
+            shape_type = random.choices(["rect", "l_shape"], weights=[65, 35], k=1)[0]
         else:
-            shape_type = random.choices(["rect", "l_shape"], weights=[70, 30], k=1)[0]
+            shape_type = "rect"
 
-        # Длина здания — заполняем ~70-85% доступной длины
-        b_len = avail_long * random.uniform(0.70, 0.85)
-        b_len = max(30, min(b_len, 120))  # 30-120м
+        # Длина здания — заполняем 75-95% доступной длины (у Ильи avg 77м, до 122м)
+        b_len = avail_long * random.uniform(0.75, 0.95)
+        b_len = max(40, min(b_len, 125))  # 40-125м
 
         hw, hd = b_len / 2, depth / 2
 
         if shape_type == "h_shape":
-            # Н-образное: два крыла + перемычка посередине
-            wing_len = b_len * 0.38  # каждое крыло ~38% общей длины
-            gap = b_len - wing_len * 2  # перемычка
-            conn_d = depth * 0.4  # глубина перемычки
+            # Н-образное (как у Ильи: 73x57м, fill ~54%)
+            # Ограничиваем размеры до масштаба Ильи
+            b_len = min(b_len, 80)
+            hw = b_len / 2
+            depth = min(60, max(40, b_len * random.uniform(0.6, 0.85)))
+            hd = depth / 2
+            wing_ratio = random.uniform(0.35, 0.45)
+            wing_len = b_len * wing_ratio
+            conn_d = depth * random.uniform(0.20, 0.35)
 
             fp = Polygon([
-                # Левое крыло
                 (cx - hw, cy - hd),
                 (cx - hw + wing_len, cy - hd),
                 (cx - hw + wing_len, cy - conn_d / 2),
-                # Перемычка нижняя
                 (cx + hw - wing_len, cy - conn_d / 2),
-                # Правое крыло
                 (cx + hw - wing_len, cy - hd),
                 (cx + hw, cy - hd),
                 (cx + hw, cy + hd),
                 (cx + hw - wing_len, cy + hd),
                 (cx + hw - wing_len, cy + conn_d / 2),
-                # Перемычка верхняя
                 (cx - hw + wing_len, cy + conn_d / 2),
                 (cx - hw + wing_len, cy + hd),
                 (cx - hw, cy + hd),
             ])
 
+        elif shape_type == "u_shape":
+            # П-образное
+            b_len = min(b_len, 65)
+            hw = b_len / 2
+            depth = min(50, max(35, b_len * random.uniform(0.6, 0.8)))
+            hd = depth / 2
+            wing_d = depth
+            base_d = depth * random.uniform(0.35, 0.50)
+            gap_w = b_len * random.uniform(0.30, 0.45)  # ширина двора
+
+            fp = Polygon([
+                (cx - hw, cy - hd),
+                (cx + hw, cy - hd),
+                (cx + hw, cy + hd),
+                (cx + hw - wing_d, cy + hd),
+                (cx + hw - wing_d, cy - hd + base_d),
+                (cx - hw + wing_d, cy - hd + base_d),
+                (cx - hw + wing_d, cy + hd),
+                (cx - hw, cy + hd),
+            ])
+
         elif shape_type == "l_shape":
-            # Г-образное
-            wing_short = b_len * 0.45
+            # Г-образное (как у Ильи: 43x38м, fill ~65%)
+            b_len = min(b_len, 55)
+            hw = b_len / 2
+            depth = min(45, max(30, b_len * random.uniform(0.7, 0.95)))
+            hd = depth / 2
+            wing_ratio = random.uniform(0.45, 0.60)
+            wing_short = b_len * wing_ratio
+            wing_depth_ratio = random.uniform(0.40, 0.55)
             fp = Polygon([
                 (cx - hw, cy - hd),
                 (cx - hw + wing_short, cy - hd),
-                (cx - hw + wing_short, cy - hd + depth * 0.4),
-                (cx + hw, cy - hd + depth * 0.4),
+                (cx - hw + wing_short, cy - hd + depth * wing_depth_ratio),
+                (cx + hw, cy - hd + depth * wing_depth_ratio),
                 (cx + hw, cy + hd),
                 (cx - hw, cy + hd),
             ])
@@ -460,39 +782,57 @@ def generate_parcel_based_layout(site_data: dict, config: dict) -> list[dict]:
             # Прямоугольник (вытянутый 1:4 - 1:6)
             fp = box(cx - hw, cy - hd, cx + hw, cy + hd)
 
-        # Поворот по главной оси участка
-        fp_rotated = rotate(fp, main_angle, origin=(cx, cy))
+        # Поворот по оси конкретного участка (у Ильи два направления ~38° и ~128°)
+        p_mrr_r = pp.minimum_rotated_rectangle
+        p_coords_r = list(p_mrr_r.exterior.coords)
+        pe1v_r = np.array(p_coords_r[1]) - np.array(p_coords_r[0])
+        pe2v_r = np.array(p_coords_r[2]) - np.array(p_coords_r[1])
+        if np.linalg.norm(pe1v_r) > np.linalg.norm(pe2v_r):
+            parcel_angle = np.degrees(np.arctan2(pe1v_r[1], pe1v_r[0]))
+        else:
+            parcel_angle = np.degrees(np.arctan2(pe2v_r[1], pe2v_r[0]))
+        # 40% шанс перпендикулярного направления (как у Ильи: ~40% зданий повёрнуты на 90°)
+        if random.random() < 0.4:
+            parcel_angle += 90
+        fp_rotated = rotate(fp, parcel_angle, origin=(cx, cy))
 
-        # Проверка что здание внутри участка (с допуском)
-        overlap = pp.intersection(fp_rotated).area / fp_rotated.area
-        if overlap < 0.7:
-            # Пробуем уменьшить
-            fp_small = rotate(box(cx - hw * 0.7, cy - hd, cx + hw * 0.7, cy + hd),
-                              main_angle, origin=(cx, cy))
-            if pp.intersection(fp_small).area / fp_small.area >= 0.7:
-                fp_rotated = fp_small
-                shape_type = "rect_small"
-            else:
-                continue
+        # Фикс невалидной геометрии
+        if not fp_rotated.is_valid:
+            fp_rotated = fp_rotated.buffer(0)
 
-        # Проверка на пересечение с уже размещёнными зданиями (мин. 8м — мягкий)
+        # Здание должно полностью влезать в зону застройки
+        if not buildable.contains(fp_rotated):
+            continue
+
+        # Проверка противопожарных разрывов между новыми зданиями (12м)
         skip = False
         for existing in buildings:
             ep = Polygon(existing["footprint"])
-            if fp_rotated.distance(ep) < 8:
+            if fp_rotated.distance(ep) < 12:
                 skip = True
                 break
         if skip:
             continue
 
         coords = list(fp_rotated.exterior.coords)[:-1]
+        # Дефолтная этажность по площади (AI потом уточнит)
+        fp_area = fp_rotated.area
+        if fp_area > 2000:
+            def_floors = random.randint(16, 25)
+        elif fp_area > 1000:
+            def_floors = random.randint(12, 20)
+        elif fp_area > 500:
+            def_floors = random.randint(9, 16)
+        else:
+            def_floors = random.randint(5, 12)
         buildings.append({
             "id": building_id,
             "footprint": [[round(c[0], 1), round(c[1], 1)] for c in coords],
-            "area_m2": round(fp_rotated.area, 0),
+            "area_m2": round(fp_area, 0),
+            "floors": def_floors,
             "shape": shape_type,
             "parcel_area": round(area, 0),
-            "orientation_deg": round(main_angle, 1),
+            "orientation_deg": round(parcel_angle, 1),
             "cx": round(cx, 1),
             "cy": round(cy, 1),
         })
@@ -1640,116 +1980,105 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None, c
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
+    import matplotlib.patheffects
     from matplotlib.collections import PatchCollection
 
+    # Тёмная тема
     fig, ax = plt.subplots(1, 1, figsize=(14, 14))
+    fig.set_facecolor('#1a1a2e')
+    ax.set_facecolor('#16213e')
 
-    # Граница участка
+    # Граница участка (яркий голубой)
     site_poly = Polygon(site_data["coordinates"])
     x, y = site_poly.exterior.xy
-    ax.plot(x, y, 'b-', linewidth=2, label='Граница участка')
+    ax.plot(x, y, color='#00d4ff', linewidth=2.5, label='Граница участка')
 
-    # Buildable area (с вырезами под существующие здания и дороги)
+    # Buildable area
     from shapely.geometry import Polygon as ShapelyPolygon
-    buildable_info = compute_buildable_area(site_data, {"setbacks": {"default": 6, "road": 10}})
+    buildable_info = compute_buildable_area(site_data, config or {})
     buildable = buildable_info["polygon"]
     if buildable.geom_type == 'Polygon':
         bx, by = buildable.exterior.xy
-        ax.plot(bx, by, 'g--', linewidth=1, alpha=0.5, label='Зона застройки')
+        ax.plot(bx, by, color='#4ecca3', linewidth=1, linestyle='--', alpha=0.6, label='Зона застройки')
     elif buildable.geom_type == 'MultiPolygon':
         for geom in buildable.geoms:
             bx, by = geom.exterior.xy
-            ax.plot(bx, by, 'g--', linewidth=1, alpha=0.5)
+            ax.plot(bx, by, color='#4ecca3', linewidth=1, linestyle='--', alpha=0.6)
 
-    # Существующие здания (серые)
+    # Существующие здания
     for eb in site_data.get("existing_buildings", []):
         ex, ey = eb["polygon"].exterior.xy
-        ax.fill(ex, ey, facecolor='gray', edgecolor='darkgray', linewidth=1, alpha=0.5)
+        ax.fill(ex, ey, facecolor='#555555', edgecolor='#888888', linewidth=1, alpha=0.7)
     if site_data.get("existing_buildings"):
-        ax.plot([], [], color='gray', linewidth=5, alpha=0.5, label=f'Существующие ({len(site_data["existing_buildings"])})')
+        ax.plot([], [], color='#888888', linewidth=5, alpha=0.7, label=f'Существующие ({len(site_data["existing_buildings"])})')
 
-    # Кадастровые участки (зелёный пунктир, тонкий)
+    # Кадастровые участки
     for parcel in site_data.get("parcels", []):
         px, py = parcel["polygon"].exterior.xy
-        ax.plot(px, py, color='green', linewidth=0.6, linestyle=':', alpha=0.4)
+        ax.plot(px, py, color='#4ecca3', linewidth=0.5, linestyle=':', alpha=0.3)
     if site_data.get("parcels"):
-        ax.plot([], [], color='green', linewidth=1, linestyle=':', alpha=0.5,
+        ax.plot([], [], color='#4ecca3', linewidth=1, linestyle=':', alpha=0.4,
                 label=f'Кадастр ({len(site_data["parcels"])})')
 
-    # Дороги (светло-коричневые)
-    for road in site_data.get("roads", []):
-        if road.geom_type == 'Polygon':
-            rx, ry = road.exterior.xy
-            ax.fill(rx, ry, facecolor='wheat', edgecolor='tan', linewidth=0.5, alpha=0.4)
-    if site_data.get("roads"):
-        ax.plot([], [], color='wheat', linewidth=5, alpha=0.5, label=f'Дороги ({len(site_data["roads"])})')
-
-    # Внутренние проезды (светло-серые)
+    # Внутренние проезды
     for iroad in site_data.get("internal_roads", []):
         road_poly = iroad["polygon"]
-        if road_poly.geom_type == 'Polygon':
-            irx, iry = road_poly.exterior.xy
-            ax.fill(irx, iry, facecolor='lightgray', edgecolor='gray', linewidth=0.5, alpha=0.5)
-        elif road_poly.geom_type == 'MultiPolygon':
-            for g in road_poly.geoms:
-                irx, iry = g.exterior.xy
-                ax.fill(irx, iry, facecolor='lightgray', edgecolor='gray', linewidth=0.5, alpha=0.5)
+        polys = [road_poly] if road_poly.geom_type == 'Polygon' else list(road_poly.geoms)
+        for rp in polys:
+            irx, iry = rp.exterior.xy
+            ax.fill(irx, iry, facecolor='#2a2a3a', edgecolor='#555', linewidth=0.5, alpha=0.6)
     if site_data.get("internal_roads"):
-        ax.plot([], [], color='lightgray', linewidth=5, alpha=0.6,
+        ax.plot([], [], color='#555', linewidth=5, alpha=0.6,
                 label=f'Проезды ({len(site_data["internal_roads"])})')
 
-    # Тени от зданий (полдень, 22 марта)
-    latitude = config.get("site", {}).get("latitude", 54.6) if config else 54.6
-    az_noon, alt_noon = compute_sun_position(latitude, 12.0)
-    if alt_noon > 2:
-        for b in massing.get("buildings", []):
-            height = b.get("total_height", b.get("floors", 15) * b.get("floor_height", 3.0))
-            shadow = compute_shadow_polygon(b["footprint"], height, az_noon, alt_noon)
-            if shadow.is_valid and shadow.area > 0:
-                if shadow.geom_type == 'Polygon':
-                    sx, sy = shadow.exterior.xy
-                    ax.fill(sx, sy, facecolor='navy', alpha=0.08)
-        ax.plot([], [], color='navy', linewidth=5, alpha=0.15, label='Тени (12:00, 22 марта)')
+    # Дороги из DWG
+    for road_poly in site_data.get("roads", []):
+        polys = [road_poly] if road_poly.geom_type == 'Polygon' else list(road_poly.geoms)
+        for rp in polys:
+            rx, ry = rp.exterior.xy
+            ax.fill(rx, ry, facecolor='#2a2a3a', edgecolor='#555', linewidth=0.5, alpha=0.7)
+    if site_data.get("roads"):
+        ax.plot([], [], color='#555', linewidth=5, alpha=0.7,
+                label=f'Дороги ({len(site_data["roads"])})')
 
-    # Здания
-    colors_by_block = {}
-    cmap = plt.cm.Set3
-    building_patches = []
-    for b in massing.get("buildings", []):
+    # Здания (яркие на тёмном фоне)
+    building_colors = ['#e94560', '#f39c12', '#00b894', '#6c5ce7',
+                       '#fd79a8', '#0984e3', '#00cec9', '#e17055',
+                       '#a29bfe', '#55efc4', '#fab1a0', '#74b9ff']
+    for i, b in enumerate(massing.get("buildings", [])):
         fp = b["footprint"]
-        poly = plt.Polygon(fp, closed=True)
-        block_id = b.get("block_id", 0)
-        if block_id not in colors_by_block:
-            colors_by_block[block_id] = cmap(len(colors_by_block) % 12)
-        color = colors_by_block[block_id]
+        color = building_colors[i % len(building_colors)]
 
-        ax.add_patch(plt.Polygon(fp, closed=True, facecolor=color, edgecolor='black',
-                                  linewidth=1.5, alpha=0.7))
+        ax.add_patch(plt.Polygon(fp, closed=True, facecolor=color,
+                                  edgecolor='white', linewidth=2, alpha=0.85))
 
-        # Подпись этажности + инсоляция
+        # Подпись
         centroid = Polygon(fp).centroid
         floors = b.get("floors", "?")
         sun_h = b.get("max_continuous_sun")
         label = f"{floors}эт"
-        if sun_h is not None:
-            label += f"\n{sun_h}ч"
-            if sun_h < 2.0:
-                # Красная обводка для нарушений инсоляции
-                ax.add_patch(plt.Polygon(fp, closed=True, facecolor='none',
-                                          edgecolor='red', linewidth=3, alpha=0.8))
+        if sun_h is not None and sun_h < 2.0:
+            label += f"\n⚠{sun_h}ч"
+            ax.add_patch(plt.Polygon(fp, closed=True, facecolor='none',
+                                      edgecolor='#ff0000', linewidth=3, alpha=0.9))
         ax.text(centroid.x, centroid.y, label, ha='center', va='center',
-                fontsize=6, fontweight='bold')
+                fontsize=7, fontweight='bold', color='white',
+                path_effects=[matplotlib.patheffects.withStroke(linewidth=2, foreground='black')])
 
     ax.set_aspect('equal')
 
     summary = massing.get("summary", {})
     ax.set_title(f"Массинг — {summary.get('total_buildings', '?')} зданий, "
                  f"{summary.get('total_sellable_area', '?')} м²",
-                 fontsize=14)
-    ax.legend(loc='upper right', fontsize=8)
-    ax.grid(True, alpha=0.3)
+                 fontsize=14, color='white', fontweight='bold')
+    legend = ax.legend(loc='upper right', fontsize=8, facecolor='#1a1a2e',
+                       edgecolor='#444', labelcolor='white')
+    ax.tick_params(colors='#aaa')
+    for spine in ax.spines.values():
+        spine.set_color('#444')
+    ax.grid(True, alpha=0.15, color='#555')
 
-    # Сводная таблица внизу
+    # Сводка
     info_parts = [
         f"Плотность: {summary.get('density', '?')}",
         f"Покрытие: {summary.get('site_coverage_ratio', '?')}",
@@ -1758,7 +2087,7 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None, c
         info_parts.append(f"~{summary['est_apartments']} кв.")
         info_parts.append(f"~{summary.get('est_parking_spots', '?')} м/м")
         info_parts.append(f"~{summary.get('est_residents', '?')} жит.")
-    fig.text(0.5, 0.01, " | ".join(info_parts), ha='center', fontsize=9, color='gray')
+    fig.text(0.5, 0.01, " | ".join(info_parts), ha='center', fontsize=9, color='#aaa')
 
     if output_path:
         plt.savefig(output_path, dpi=150, bbox_inches='tight')

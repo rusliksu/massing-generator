@@ -8,3 +8,4 @@ config.yaml
 !config.example.yaml
 venv/
 .venv/
+test_output/
