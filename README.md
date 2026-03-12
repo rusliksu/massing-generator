@@ -72,6 +72,8 @@ write_massing_to_dxf(viz, site, "output.dxf")
 
 ## Example Output
 
+![Example massing layout](example.png)
+
 ```
 Perimeter layout: 16 floors (48m), block 150×100m, section 50m, street 18m
 Placed 37 buildings (best of 10 attempts, seed=9)
