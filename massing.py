@@ -323,77 +323,124 @@ def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: 
     if area < 10000:
         return _generate_small_site_layout(config, buildable, main_angle, rng)
 
-    # Параметры квартала (блок = П-образный или замкнутый двор)
+    # === Периметральная застройка ===
     #
-    #   ══════════════════   длинный корпус (~60м x 13м)
-    #   ║                ║
-    #   ║     ДВОР       ║   торцевые корпуса (~24м x 13м)
-    #   ║                ║
-    #   ══════════════════   длинный корпус (~60м x 13м)
+    #   Квартал ~150×100м. Здания — секциями по периметру, двор внутри.
+    #   Между кварталами — улицы 15-20м (пожарный проезд + тротуары).
     #
-    ROAD_WIDTH = 8        # пожарный проезд между кварталами (м)
-    DEPTH = 13            # глубина корпуса (м)
-    COURTYARD_W = 35      # ширина двора (между длинными корпусами) (м)
-    LONG_LEN = 60         # длина длинного корпуса (м)
-    SHORT_LEN = 24        # длина торцевого корпуса (≈ COURTYARD_W - зазоры)
-    FIRE_GAP = 12         # пожарный разрыв (м)
+    #   ┌──────┐  ┌──────┐  ┌──────┐     ← секции по длинной стороне
+    #   │      │  │      │  │      │
+    #   │  ┌───┘  └──────┘  └───┐  │
+    #   │  │                    │  │     ← торцевые секции
+    #   │  │       ДВОР         │  │
+    #   │  │                    │  │
+    #   │  └───┐  ┌──────┐  ┌──┘  │
+    #   │      │  │      │  │     │
+    #   └──────┘  └──────┘  └─────┘
+    #
 
-    # Габарит одного квартала
-    block_w = LONG_LEN                          # вдоль main_angle
-    block_h = COURTYARD_W + 2 * DEPTH           # поперёк
+    # Автодетект единиц: если площадь > 10^8, координаты в мм → масштаб 1000
+    U = 1000.0 if area > 1e8 else 1.0
+    if U > 1:
+        print(f"  Координаты в мм (area={area:.0f}), масштаб ×{U:.0f}")
+
+    DEPTH = 13 * U        # глубина секции (м→ед.чертежа)
+    FLOOR_H = 3.0         # высота этажа (м) — не масштабируется
+    FIRE_GAP = 6 * U      # ж/б ↔ ж/б (СП 4.13130, I-II степень)
+    STREET_W = 18 * U     # улица между кварталами (проезд+тротуар)
+    SECTION_LEN = 50 * U  # длина одной секции
+    SECTION_GAP = 6 * U   # разрыв между секциями (проход во двор)
+    BLOCK_W = 150 * U     # квартал вдоль main_angle
+    BLOCK_H = 100 * U     # квартал поперёк
+
+    target_floors = config.get("max_floors", 16)
+    building_h = target_floors * FLOOR_H
+
+    print(f"  Периметральная застройка: {target_floors} эт. ({building_h:.0f}м), "
+          f"блок {BLOCK_W/U:.0f}×{BLOCK_H/U:.0f}м, секция {SECTION_LEN/U:.0f}м, "
+          f"улица {STREET_W/U:.0f}м, разрыв {SECTION_GAP/U:.0f}м")
 
     rad = np.radians(main_angle)
     cos_a, sin_a = np.cos(rad), np.sin(rad)
-    cos_p, sin_p = -sin_a, cos_a
+    cos_p, sin_p = -sin_a, cos_a  # перпендикулярное направление
 
     cx, cy = buildable.centroid.x, buildable.centroid.y
     span = area ** 0.5 * 1.2
 
-    step_long = block_w + ROAD_WIDTH
-    step_across = block_h + ROAD_WIDTH
+    step_long = BLOCK_W + STREET_W
+    step_across = BLOCK_H + STREET_W
 
     n_long = int(span / step_long) + 1
     n_across = int(span / step_across) + 1
 
-    def _make_block(qx, qy):
-        """Создаёт квартал из 3-4 зданий вокруг двора. Возвращает список или None."""
-        half_court = COURTYARD_W / 2
-        half_long = LONG_LEN / 2
-        blds = []
+    def _place_section(ox, oy, angle, length):
+        """Создаёт одну секцию здания (прямоугольник) в заданной точке и ориентации."""
+        hw, hd = length / 2, DEPTH / 2
+        fp = box(ox - hw, oy - hd, ox + hw, oy + hd)
+        fp_rot = rotate(fp, angle, origin=(ox, oy))
+        is_long = abs((angle - main_angle) % 180) < 10 or abs((angle - main_angle) % 180) > 170
+        return {
+            'poly': fp_rot, 'cx': ox, 'cy': oy,
+            'coords': list(fp_rot.exterior.coords)[:-1],
+            'area': fp_rot.area, 'len': length,
+            'type': 'long' if is_long else 'short',
+            'angle': angle,
+        }
 
-        # 2 длинных параллельных корпуса
-        for side in [-1, 1]:
-            px = qx + side * (half_court + DEPTH / 2) * cos_p
-            py = qy + side * (half_court + DEPTH / 2) * sin_p
-            hw, hd = half_long, DEPTH / 2
-            fp = box(px - hw, py - hd, px + hw, py + hd)
-            fp_rot = rotate(fp, main_angle, origin=(px, py))
-            blds.append({'poly': fp_rot, 'cx': px, 'cy': py,
-                         'coords': list(fp_rot.exterior.coords)[:-1],
-                         'area': fp_rot.area, 'len': LONG_LEN})
+    def _make_perimeter_block(qx, qy):
+        """Создаёт периметральный квартал: секции по 4 сторонам прямоугольника."""
+        sections = []
+        half_w = BLOCK_W / 2
+        half_h = BLOCK_H / 2
 
-        # 2 торцевых (перпендикулярных) корпуса — замыкают двор
-        for end in [-1, 1]:
-            px = qx + end * (half_long - DEPTH / 2) * cos_a
-            py = qy + end * (half_long - DEPTH / 2) * sin_a
-            hw, hd = SHORT_LEN / 2, DEPTH / 2
-            fp = box(px - hw, py - hd, px + hw, py + hd)
-            fp_rot = rotate(fp, main_angle + 90, origin=(px, py))
-            blds.append({'poly': fp_rot, 'cx': px, 'cy': py,
-                         'coords': list(fp_rot.exterior.coords)[:-1],
-                         'area': fp_rot.area, 'len': SHORT_LEN})
+        # --- Длинные стороны (вдоль main_angle) ---
+        # Сколько секций помещается по длинной стороне
+        usable_long = BLOCK_W - DEPTH  # за вычетом углов (торцевые секции)
+        n_sec = max(1, int((usable_long + SECTION_GAP) / (SECTION_LEN + SECTION_GAP)))
+        actual_gap = (usable_long - n_sec * SECTION_LEN) / max(1, n_sec - 1) if n_sec > 1 else 0
+        actual_gap = max(actual_gap, SECTION_GAP)
+        # Пересчитать длину секции если зазоры вышли слишком большие
+        sec_len = min(SECTION_LEN, (usable_long - (n_sec - 1) * actual_gap) / n_sec) if n_sec > 0 else SECTION_LEN
 
-        return blds
+        for side in [-1, 1]:  # верхняя и нижняя стороны
+            for si in range(n_sec):
+                # Смещение секции вдоль длинной стороны
+                total_span = n_sec * sec_len + (n_sec - 1) * actual_gap
+                start = -total_span / 2 + si * (sec_len + actual_gap) + sec_len / 2
+                sx = qx + start * cos_a + side * (half_h - DEPTH / 2) * cos_p
+                sy = qy + start * sin_a + side * (half_h - DEPTH / 2) * sin_p
+                sections.append(_place_section(sx, sy, main_angle, sec_len))
+
+        # --- Короткие стороны (перпендикулярно main_angle) ---
+        usable_short = BLOCK_H - DEPTH
+        n_sec_s = max(1, int((usable_short + SECTION_GAP) / (SECTION_LEN + SECTION_GAP)))
+        # Торцевые секции могут быть короче
+        sec_len_s = min(SECTION_LEN, (usable_short - (n_sec_s - 1) * SECTION_GAP) / n_sec_s) if n_sec_s > 0 else SECTION_LEN
+
+        for end in [-1, 1]:  # левая и правая стороны
+            for si in range(n_sec_s):
+                total_span_s = n_sec_s * sec_len_s + (n_sec_s - 1) * SECTION_GAP
+                start = -total_span_s / 2 + si * (sec_len_s + SECTION_GAP) + sec_len_s / 2
+                sx = qx + end * (half_w - DEPTH / 2) * cos_a + start * cos_p
+                sy = qy + end * (half_w - DEPTH / 2) * sin_a + start * sin_p
+                sections.append(_place_section(sx, sy, main_angle + 90, sec_len_s))
+
+        return sections
 
     best_buildings = []
     best_total = 0
 
-    for attempt in range(n_variants):
+    from shapely import prepared
+    prep_buildable = prepared.prep(buildable)
+
+    # STREET_W (18м) > FIRE_GAP (6м) → секции разных блоков не могут
+    # нарушить пожарные расстояния. Проверяем только containment.
+
+    for attempt in range(min(n_variants, 10)):
         offset_long = rng.uniform(-step_long / 2, step_long / 2)
         offset_across = rng.uniform(-step_across / 2, step_across / 2)
 
         placed = []
-        placed_polys = []
 
         for bi in range(-n_long, n_long + 1):
             for bj in range(-n_across, n_across + 1):
@@ -402,44 +449,14 @@ def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: 
                 qy = cy + (bi * step_long + offset_long) * sin_a \
                          + (bj * step_across + offset_across) * sin_p
 
-                block = _make_block(qx, qy)
-
-                # Проверяем ВСЕ здания блока: внутри зоны + не пересекают уже размещённые
-                block_ok = True
-                for b in block:
-                    if not buildable.contains(b['poly']):
-                        block_ok = False
-                        break
-                    for ep in placed_polys:
-                        if ep.distance(b['poly']) < FIRE_GAP:
-                            block_ok = False
-                            break
-                    if not block_ok:
-                        break
-
-                if not block_ok:
-                    # Попробуем хотя бы 2 длинных (П-образный двор без одного торца)
-                    partial = block[:2]  # только длинные
-                    partial_ok = True
-                    for b in partial:
-                        if not buildable.contains(b['poly']):
-                            partial_ok = False
-                            break
-                        for ep in placed_polys:
-                            if ep.distance(b['poly']) < FIRE_GAP:
-                                partial_ok = False
-                                break
-                        if not partial_ok:
-                            break
-                    if partial_ok:
-                        for b in partial:
-                            placed.append(b)
-                            placed_polys.append(b['poly'])
+                # Быстрая отсечка: центр квартала внутри зоны?
+                if not prep_buildable.contains(Point(qx, qy)):
                     continue
 
-                for b in block:
-                    placed.append(b)
-                    placed_polys.append(b['poly'])
+                block = _make_perimeter_block(qx, qy)
+                for sec in block:
+                    if prep_buildable.contains(sec['poly']):
+                        placed.append(sec)
 
         total = sum(o['area'] for o in placed)
         if total > best_total:
@@ -447,8 +464,8 @@ def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: 
             best_buildings = placed
 
     # Финализация
-    buildings = _finalize_buildings(best_buildings, rng)
-    print(f"  Размещено {len(buildings)} зданий (квартальная сетка, "
+    buildings = _finalize_buildings(best_buildings, rng, target_floors, unit_scale=U)
+    print(f"  Размещено {len(buildings)} зданий (периметральная застройка, "
           f"лучшая из {n_variants} попыток, seed={seed})")
     return buildings
 
@@ -531,17 +548,21 @@ def _generate_small_site_layout(config: dict, buildable, main_angle: float,
     return buildings
 
 
-def _finalize_buildings(placed: list[dict], rng) -> list[dict]:
-    """Преобразует внутренний формат зданий в выходной."""
+def _finalize_buildings(placed: list[dict], rng, target_floors: int = 16,
+                        unit_scale: float = 1.0) -> list[dict]:
+    """Преобразует внутренний формат зданий в выходной.
+    Этажность: длинные корпуса — target_floors, торцевые — меньше.
+    unit_scale: множитель единиц (1000 если координаты в мм)."""
     buildings = []
+    area_div = unit_scale ** 2  # мм² → м²
     for i, b in enumerate(placed, 1):
-        fp_area = b['area']
-        if fp_area > 1000:
-            floors = rng.randint(16, 25)
-        elif fp_area > 500:
-            floors = rng.randint(12, 20)
+        fp_area = b['area'] / area_div
+        btype = b.get('type', 'long')
+        if btype == 'long':
+            floors = target_floors
         else:
-            floors = rng.randint(9, 16)
+            # Торцевые обычно ниже (стилобат или пониженный корпус)
+            floors = max(5, target_floors - rng.randint(2, 5))
         buildings.append({
             'id': i,
             'footprint': [[round(c[0], 1), round(c[1], 1)] for c in b['coords']],
@@ -554,9 +575,14 @@ def _finalize_buildings(placed: list[dict], rng) -> list[dict]:
     return buildings
 
 
-def compute_summary(buildings: list[dict], site_data: dict) -> dict:
+def compute_summary(site_data: dict, config: dict, buildings: list[dict]) -> dict:
     """Вычисляет сводку: площади, квартиры, машиноместа, жители."""
-    site_poly = Polygon(site_data["coordinates"])
+    raw_area = site_data.get("area_m2", 0)
+    # Автодетект единиц: area_m2 > 10^8 → координаты в мм, площадь в мм²
+    area_div = 1e6 if raw_area > 1e8 else 1.0
+    site_area_m2 = raw_area / area_div
+
+    # area_m2 в зданиях уже конвертировано в м² через _finalize_buildings
     total_footprint = sum(b.get('area_m2', 0) for b in buildings)
     total_sellable = 0
     total_apartments = 0
@@ -572,17 +598,32 @@ def compute_summary(buildings: list[dict], site_data: dict) -> dict:
 
     total_residents = int(total_apartments * 2.3)
     parking = total_apartments  # 1 м/м на квартиру (СП 42.13330)
-    coverage = total_footprint / site_poly.area if site_poly.area > 0 else 0
+    coverage = total_footprint / site_area_m2 if site_area_m2 > 0 else 0
+
+    # Озеленение: СП 42.13330 — не менее 25% площади квартала
+    green_area = site_area_m2 - total_footprint  # грубая оценка (без дорог/парковок)
+    green_ratio = green_area / site_area_m2 if site_area_m2 > 0 else 0
+    green_ok = green_ratio >= 0.25
+
+    # КПЗ = суммарная поэтажная площадь / площадь участка
+    total_gross = sum(b.get('area_m2', 0) * b.get('floors', 1) for b in buildings)
+    kpz = total_gross / site_area_m2 if site_area_m2 > 0 else 0
 
     return {
         'total_buildings': len(buildings),
         'total_sellable_area': f'{total_sellable:.0f}',
         'total_footprint': f'{total_footprint:.0f}',
+        'total_area_m2': round(total_gross, 0),
+        'site_area_m2': round(site_area_m2, 0),
         'density': f'{coverage:.1%}',
+        'kz': round(coverage, 3),
         'site_coverage_ratio': f'{coverage:.1%}',
         'est_apartments': total_apartments,
         'est_parking_spots': parking,
         'est_residents': total_residents,
+        'kpz': round(kpz, 2),
+        'green_ratio': round(green_ratio, 3),
+        'green_ok': green_ok,
     }
 
 
@@ -595,7 +636,7 @@ def generate_variants(site_data: dict, config: dict, n_seeds: int = 5,
     for s in range(n_seeds):
         buildings = generate_parcel_based_layout(
             site_data, config, seed=s, n_variants=n_variants_per_seed)
-        summary = compute_summary(buildings, site_data)
+        summary = compute_summary(site_data, config, buildings)
         total_area = sum(b.get('area_m2', 0) * b.get('floors', 1) for b in buildings)
         results.append({
             'seed': s,
@@ -2202,13 +2243,16 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None, c
 
     # Сводка
     info_parts = [
-        f"Плотность: {summary.get('density', '?')}",
-        f"Покрытие: {summary.get('site_coverage_ratio', '?')}",
+        f"КЗ: {summary.get('density', '?')}",
+        f"КПЗ: {summary.get('kpz', '?')}",
     ]
     if summary.get("est_apartments"):
         info_parts.append(f"~{summary['est_apartments']} кв.")
         info_parts.append(f"~{summary.get('est_parking_spots', '?')} м/м")
         info_parts.append(f"~{summary.get('est_residents', '?')} жит.")
+    green = summary.get('green_ratio', '?')
+    green_mark = "OK" if summary.get('green_ok') else "МАЛО"
+    info_parts.append(f"Озел: {green} ({green_mark})")
     fig.text(0.5, 0.01, " | ".join(info_parts), ha='center', fontsize=9, color='#aaa')
 
     if output_path:
