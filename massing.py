@@ -344,14 +344,14 @@ def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: 
     if U > 1:
         print(f"  Координаты в мм (area={area:.0f}), масштаб ×{U:.0f}")
 
-    DEPTH = 13 * U        # глубина секции (м→ед.чертежа)
+    DEPTH = 14 * U        # глубина секции (м→ед.чертежа)
     FLOOR_H = 3.0         # высота этажа (м) — не масштабируется
     FIRE_GAP = 6 * U      # ж/б ↔ ж/б (СП 4.13130, I-II степень)
-    STREET_W = 18 * U     # улица между кварталами (проезд+тротуар)
-    SECTION_LEN = 50 * U  # длина одной секции
-    SECTION_GAP = 6 * U   # разрыв между секциями (проход во двор)
-    BLOCK_W = 150 * U     # квартал вдоль main_angle
-    BLOCK_H = 100 * U     # квартал поперёк
+    STREET_W = 15 * U     # улица между кварталами (проезд 6м + тротуары)
+    SECTION_LEN = 48 * U  # длина одной секции
+    SECTION_GAP = 3 * U   # узкий разрыв (проход во двор / арка)
+    BLOCK_W = 120 * U     # квартал вдоль main_angle
+    BLOCK_H = 80 * U      # квартал поперёк
 
     target_floors = config.get("max_floors", 16)
     building_h = target_floors * FLOOR_H
@@ -425,6 +425,21 @@ def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: 
                 sy = qy + end * (half_w - DEPTH / 2) * sin_a + start * sin_p
                 sections.append(_place_section(sx, sy, main_angle + 90, sec_len_s))
 
+        # --- Угловые секции (квадратные, замыкают периметр) ---
+        for sw in [-1, 1]:
+            for sh in [-1, 1]:
+                cx_c = qx + sw * (half_w - DEPTH / 2) * cos_a + sh * (half_h - DEPTH / 2) * cos_p
+                cy_c = qy + sw * (half_w - DEPTH / 2) * sin_a + sh * (half_h - DEPTH / 2) * sin_p
+                hw_c = DEPTH / 2
+                fp = box(cx_c - hw_c, cy_c - hw_c, cx_c + hw_c, cy_c + hw_c)
+                fp_rot = rotate(fp, main_angle, origin=(cx_c, cy_c))
+                sections.append({
+                    'poly': fp_rot, 'cx': cx_c, 'cy': cy_c,
+                    'coords': list(fp_rot.exterior.coords)[:-1],
+                    'area': fp_rot.area, 'len': DEPTH,
+                    'type': 'short', 'angle': main_angle,
+                })
+
         return sections
 
     best_buildings = []
@@ -441,6 +456,7 @@ def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: 
         offset_across = rng.uniform(-step_across / 2, step_across / 2)
 
         placed = []
+        block_centers = []  # для визуализации улиц/дворов
 
         for bi in range(-n_long, n_long + 1):
             for bj in range(-n_across, n_across + 1):
@@ -454,19 +470,70 @@ def _generate_grid_layout(site_data: dict, config: dict, buildable, main_angle: 
                     continue
 
                 block = _make_perimeter_block(qx, qy)
+                block_placed = 0
                 for sec in block:
                     if prep_buildable.contains(sec['poly']):
                         placed.append(sec)
+                        block_placed += 1
+                if block_placed >= 3:
+                    block_centers.append((qx, qy))
+
+        # --- Infill: одиночные секции в пустотах ---
+        from shapely.ops import unary_union
+        placed_union = unary_union([s['poly'].buffer(FIRE_GAP) for s in placed]) if placed else None
+        # Остаточная зона = buildable минус буферы зданий
+        if placed_union:
+            remaining = buildable.difference(placed_union)
+        else:
+            remaining = buildable
+
+        if remaining.area > 0:
+            # Сканируем сеткой с шагом = длина секции
+            infill_step = SECTION_LEN * 0.8
+            minx, miny, maxx, maxy = remaining.bounds
+            for ix in np.arange(minx + DEPTH, maxx - DEPTH, infill_step):
+                for iy in np.arange(miny + DEPTH, maxy - DEPTH, infill_step):
+                    if not remaining.contains(Point(ix, iy)):
+                        continue
+                    # Пробуем секцию вдоль main_angle, потом перпендикулярно
+                    for a_off in [0, 90]:
+                        angle = main_angle + a_off
+                        for slen in [SECTION_LEN, SECTION_LEN * 0.6, SECTION_LEN * 0.4]:
+                            sec = _place_section(ix, iy, angle, slen)
+                            if prep_buildable.contains(sec['poly']):
+                                # Проверяем FIRE_GAP до существующих
+                                sec_buf = sec['poly'].buffer(FIRE_GAP)
+                                if placed_union is None or not sec_buf.intersects(placed_union):
+                                    placed.append(sec)
+                                    placed_union = unary_union([placed_union, sec['poly'].buffer(FIRE_GAP)]) if placed_union else sec['poly'].buffer(FIRE_GAP)
+                                    break
+                        else:
+                            continue
+                        break
 
         total = sum(o['area'] for o in placed)
         if total > best_total:
             best_total = total
             best_buildings = placed
+            best_block_centers = block_centers[:]
 
     # Финализация
     buildings = _finalize_buildings(best_buildings, rng, target_floors, unit_scale=U)
-    print(f"  Размещено {len(buildings)} зданий (периметральная застройка, "
+    n_perim = sum(1 for b in best_buildings if b.get('type') in ('long', 'short'))
+    n_infill = len(best_buildings) - n_perim
+    print(f"  Размещено {len(buildings)} зданий ({n_perim} периметр + {n_infill} infill, "
           f"лучшая из {n_variants} попыток, seed={seed})")
+
+    # Метаданные блоков для визуализации
+    block_meta = {
+        'block_centers': best_block_centers,
+        'block_w': BLOCK_W, 'block_h': BLOCK_H,
+        'street_w': STREET_W, 'main_angle': main_angle,
+    }
+    # Прикрепляем к каждому зданию (хак, но работает)
+    for b in buildings:
+        b['_block_meta'] = block_meta
+
     return buildings
 
 
@@ -1764,7 +1831,10 @@ def check_insolation(massing: dict, config: dict) -> list[dict]:
     building_data = []
     for b in buildings:
         fp = b["footprint"]
-        height = b.get("total_height", b.get("floors", 15) * b.get("floor_height", 3.0))
+        # Нормализация: Polygon → list of tuples
+        if isinstance(fp, Polygon):
+            fp = list(fp.exterior.coords)
+        height = b.get("total_height", b.get("height", b.get("floors", 15) * b.get("floor_height", 3.0)))
         poly = Polygon(fp)
         building_data.append({"building": b, "polygon": poly, "height": height,
                               "footprint": fp})
@@ -2204,29 +2274,74 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None, c
         ax.plot([], [], color='#555', linewidth=5, alpha=0.7,
                 label=f'Дороги ({len(site_data["roads"])})')
 
-    # Здания (яркие на тёмном фоне)
-    building_colors = ['#e94560', '#f39c12', '#00b894', '#6c5ce7',
-                       '#fd79a8', '#0984e3', '#00cec9', '#e17055',
-                       '#a29bfe', '#55efc4', '#fab1a0', '#74b9ff']
-    for i, b in enumerate(massing.get("buildings", [])):
+    # --- Кварталы: дворы (зелёные) + контуры блоков ---
+    import numpy as np
+    from shapely.geometry import box as shp_box
+    buildings_list = massing.get("buildings", [])
+    block_meta = buildings_list[0].get('_block_meta') if buildings_list else None
+    if block_meta:
+        from shapely.affinity import rotate as shp_rotate
+        bw = block_meta['block_w']
+        bh = block_meta['block_h']
+        ma = block_meta['main_angle']
+        for (bcx, bcy) in block_meta['block_centers']:
+            # Рисуем блок как прямоугольник
+            block_rect = shp_box(bcx - bw/2, bcy - bh/2, bcx + bw/2, bcy + bh/2)
+            block_rect = shp_rotate(block_rect, ma, origin=(bcx, bcy))
+            bx_r, by_r = block_rect.exterior.xy
+            # Двор (зелёный, внутри блока)
+            ax.fill(bx_r, by_r, facecolor='#1b4332', edgecolor='none', alpha=0.4)
+            # Контур блока (тонкая линия)
+            ax.plot(bx_r, by_r, color='#4ecca3', linewidth=0.7, alpha=0.5)
+        # Легенда
+        ax.fill([], [], facecolor='#1b4332', alpha=0.4, label='Дворы')
+
+    # --- Улицы (серые полосы вдоль границ блоков) ---
+    # Рисуются как фон между блоками — заливаем buildable минус блоки серым
+    if block_meta and block_meta['block_centers']:
+        from shapely.ops import unary_union
+        from shapely.affinity import rotate as shp_rotate
+        all_blocks = []
+        for (bcx, bcy) in block_meta['block_centers']:
+            br = shp_box(bcx - bw/2, bcy - bh/2, bcx + bw/2, bcy + bh/2)
+            br = shp_rotate(br, ma, origin=(bcx, bcy))
+            all_blocks.append(br)
+        blocks_union = unary_union(all_blocks)
+        street_zone = buildable.difference(blocks_union)
+        if street_zone.geom_type == 'Polygon':
+            street_polys = [street_zone]
+        elif street_zone.geom_type == 'MultiPolygon':
+            street_polys = list(street_zone.geoms)
+        else:
+            street_polys = []
+        for sp in street_polys:
+            sx, sy = sp.exterior.xy
+            ax.fill(sx, sy, facecolor='#2d3436', edgecolor='none', alpha=0.5)
+        if street_polys:
+            ax.fill([], [], facecolor='#2d3436', alpha=0.5, label='Улицы/проезды')
+
+    # Здания
+    for i, b in enumerate(buildings_list):
         fp = b["footprint"]
-        color = building_colors[i % len(building_colors)]
+        floors = b.get("floors", 16)
+        # Цвет по этажности: тёплые тона для высоких, холодные для низких
+        t = min(1.0, floors / 20)
+        r = int(180 + 75 * t)
+        g = int(100 + 60 * (1 - t))
+        bl = int(80 + 50 * (1 - t))
+        color = f'#{r:02x}{g:02x}{bl:02x}'
 
         ax.add_patch(plt.Polygon(fp, closed=True, facecolor=color,
-                                  edgecolor='white', linewidth=2, alpha=0.85))
+                                  edgecolor='#ffffff', linewidth=1.2, alpha=0.9))
 
-        # Подпись
+        # Подпись этажности (только если здание достаточно большое)
         centroid = Polygon(fp).centroid
-        floors = b.get("floors", "?")
-        sun_h = b.get("max_continuous_sun")
-        label = f"{floors}эт"
-        if sun_h is not None and sun_h < 2.0:
-            label += f"\n⚠{sun_h}ч"
-            ax.add_patch(plt.Polygon(fp, closed=True, facecolor='none',
-                                      edgecolor='#ff0000', linewidth=3, alpha=0.9))
-        ax.text(centroid.x, centroid.y, label, ha='center', va='center',
-                fontsize=7, fontweight='bold', color='white',
-                path_effects=[matplotlib.patheffects.withStroke(linewidth=2, foreground='black')])
+        barea = b.get('area_m2', 0)
+        if barea > 400:
+            label = f"{floors}"
+            ax.text(centroid.x, centroid.y, label, ha='center', va='center',
+                    fontsize=5, fontweight='bold', color='white',
+                    path_effects=[matplotlib.patheffects.withStroke(linewidth=1.5, foreground='black')])
 
     ax.set_aspect('equal')
 
@@ -2261,11 +2376,285 @@ def visualize_massing(massing: dict, site_data: dict, output_path: str = None, c
     plt.close()
 
 
+def generate_massing_image(site_data: dict, config: dict, output_path: str,
+                           hf_token: str = None, ssh_host: str = "vps") -> str:
+    """
+    Генерация картинки массинга через FLUX на VPS.
+    Возвращает путь к скачанной картинке.
+    """
+    bounds = site_data["bounds"]
+    site_w = site_data["width"]
+    site_h = site_data["height"]
+    area = site_data["area_m2"]
+    max_floors = config.get("constraints", {}).get("max_floors", 16)
+
+    # Определяем пропорции участка для промпта
+    if site_w > site_h * 1.5:
+        shape_desc = "elongated horizontal"
+    elif site_h > site_w * 1.5:
+        shape_desc = "elongated vertical"
+    else:
+        shape_desc = "roughly square"
+
+    # Определяем масштаб застройки
+    if area > 100000:
+        scale_desc = "large residential quarter, multiple courtyards"
+        n_buildings = "15-25"
+    elif area > 30000:
+        scale_desc = "medium residential block"
+        n_buildings = "8-15"
+    else:
+        scale_desc = "small residential site"
+        n_buildings = "4-8"
+
+    prompt = (
+        f"aerial top-down architectural masterplan, {scale_desc}, "
+        f"{shape_desc} site {site_w:.0f}x{site_h:.0f} meters, "
+        f"{n_buildings} apartment buildings {max_floors} floors, "
+        f"perimeter block layout, courtyards with green space inside, "
+        f"roads between blocks, parking areas, "
+        f"clean white background, no text no labels, "
+        f"professional urban planning style, orthographic projection"
+    )
+
+    print(f"  FLUX промпт: {prompt[:100]}...")
+
+    # Генерация через VPS (ssh + image-gen.sh)
+    import shlex
+    import time as _time
+    remote_path = f"/tmp/massing_gen_{int(_time.time())}.jpg"
+    # Двойное экранирование: shlex.quote для локального shell, потом для удалённого
+    escaped_prompt = shlex.quote(prompt)
+    remote_cmd = f"bash /home/openclaw/image-gen.sh {escaped_prompt} {remote_path}"
+    cmd = ["ssh", ssh_host, remote_cmd]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if result.returncode != 0:
+        raise RuntimeError(f"FLUX генерация не удалась: {result.stderr}")
+
+    # Скачиваем картинку
+    output_path_posix = output_path.replace("\\", "/")
+    scp_cmd = f"scp {ssh_host}:{remote_path} {shlex.quote(output_path_posix)}"
+    subprocess.run(scp_cmd, shell=True, check=True, timeout=30)
+
+    print(f"  Картинка: {output_path}")
+    return output_path
+
+
+def extract_buildings_from_image(image_path: str, site_data: dict,
+                                 openrouter_key: str = None,
+                                 vision_model: str = "google/gemini-2.0-flash-001") -> dict:
+    """
+    Извлечение зданий из картинки массинга через Vision API (OpenRouter).
+    Картинка (рендер от генеративки) → Vision → JSON с зданиями.
+    """
+    import base64
+    import re
+    import time as _time
+    import httpx
+
+    img_path = Path(image_path)
+    if not img_path.exists():
+        raise FileNotFoundError(f"Картинка не найдена: {image_path}")
+
+    with open(img_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    suffix = img_path.suffix.lower()
+    media_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                   ".gif": "image/gif", ".webp": "image/webp"}
+    media_type = media_types.get(suffix, "image/jpeg")
+
+    bounds = site_data["bounds"]
+    site_w = site_data["width"]
+    site_h = site_data["height"]
+    area = site_data["area_m2"]
+
+    prompt = f"""Ты — эксперт по анализу генпланов и массинга жилых зданий.
+
+На изображении — вид сверху (план/рендер) жилой застройки на участке.
+
+## Участок
+- Площадь: {area} м²
+- Размеры: {site_w:.0f} × {site_h:.0f} м
+- Координаты (м): X [{bounds['min_x']:.0f} .. {bounds['max_x']:.0f}], Y [{bounds['min_y']:.0f} .. {bounds['max_y']:.0f}]
+
+## Задача
+Найди ВСЕ здания на изображении и определи для каждого:
+1. **Положение** — центр здания в относительных координатах изображения (0.0–1.0 по X и Y)
+2. **Размеры** — примерная длина и ширина в метрах (оцени по масштабу участка)
+3. **Этажность** — оцени по виду (тени, высота, подписи). Если не ясно — 9 этажей по умолчанию
+4. **Форма** — rectangular, L-shaped, U-shaped, curved
+5. **Угол поворота** — в градусах от горизонтали (0–180)
+
+## Формат ответа — ТОЛЬКО JSON, без markdown:
+{{
+  "buildings": [
+    {{
+      "id": 1,
+      "center_x": 0.3,
+      "center_y": 0.5,
+      "length": 60,
+      "width": 18,
+      "floors": 12,
+      "shape": "rectangular",
+      "angle": 45,
+      "notes": "..."
+    }}
+  ],
+  "image_description": "краткое описание того, что на картинке",
+  "estimated_total_buildings": 8
+}}
+
+ВАЖНО:
+- center_x, center_y — ОТНОСИТЕЛЬНЫЕ координаты (0.0 = левый/нижний край, 1.0 = правый/верхний)
+- Размеры в МЕТРАХ
+- Если здание L/U-образное, длина и ширина — габариты описывающего прямоугольника
+- Не пропускай мелкие здания (паркинги, коммерция)"""
+
+    api_url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if openrouter_key:
+        headers["Authorization"] = f"Bearer {openrouter_key}"
+
+    payload = {
+        "model": vision_model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{img_b64}"}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+        "max_tokens": 4096,
+        "temperature": 0,
+    }
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with httpx.Client(timeout=120) as client:
+                resp = client.post(api_url, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                delay = 10 * (attempt + 1)
+                print(f"  Ошибка, повтор через {delay}с... ({e})")
+                _time.sleep(delay)
+                continue
+            raise
+
+    text = data["choices"][0]["message"]["content"]
+
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r'\{[\s\S]*\}', text)
+        if match:
+            result = json.loads(match.group())
+        else:
+            raise ValueError(f"Не удалось распарсить JSON из ответа Vision API:\n{text}")
+
+    print(f"  Vision API ({vision_model}): найдено {len(result.get('buildings', []))} зданий")
+    if result.get("image_description"):
+        print(f"  Описание: {result['image_description']}")
+
+    return result
+
+
+def map_image_to_site(vision_result: dict, site_data: dict, config: dict) -> dict:
+    """
+    Привязка зданий из Vision API к реальным координатам участка.
+    Относительные координаты (0-1) → метры → footprint полигоны → massing dict.
+    """
+    import math
+
+    bounds = site_data["bounds"]
+    site_w = site_data["width"]
+    site_h = site_data["height"]
+    min_x = bounds["min_x"]
+    min_y = bounds["min_y"]
+
+    floor_height = config.get("constraints", {}).get("min_floor_height", 3.0)
+    buildings = []
+
+    for b in vision_result.get("buildings", []):
+        # Относительные координаты → абсолютные метры
+        cx = min_x + b["center_x"] * site_w
+        cy = min_y + b["center_y"] * site_h
+        length = b.get("length", 50)
+        width = b.get("width", 16)
+        floors = b.get("floors", 9)
+        angle_deg = b.get("angle", 0)
+        shape = b.get("shape", "rectangular")
+
+        # Генерация footprint
+        if shape == "L-shaped":
+            poly = _make_l_shape(cx, cy, length, width, width)
+            footprint_coords = list(poly.exterior.coords)
+        elif shape == "U-shaped":
+            poly = _make_u_shape(cx, cy, length, width, width, max(width * 0.4, 8))
+            footprint_coords = list(poly.exterior.coords)
+        else:
+            # Прямоугольник с поворотом
+            hw = length / 2
+            hh = width / 2
+            corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+            angle_rad = math.radians(angle_deg)
+            cos_a = math.cos(angle_rad)
+            sin_a = math.sin(angle_rad)
+            footprint_coords = [
+                (cx + x * cos_a - y * sin_a, cy + x * sin_a + y * cos_a)
+                for x, y in corners
+            ]
+
+        height = floors * floor_height
+        gross_area = Polygon(footprint_coords).area * floors
+        sellable_area = round(gross_area * 0.75)
+
+        buildings.append({
+            "id": b["id"],
+            "footprint": footprint_coords,
+            "floors": floors,
+            "height": height,
+            "gross_area": round(gross_area),
+            "sellable_area": sellable_area,
+            "shape": shape,
+            "source": "image",
+        })
+
+    # Собираем massing dict (совместим с validate/write/visualize)
+    total_gross = sum(b["gross_area"] for b in buildings)
+    total_sell = sum(b["sellable_area"] for b in buildings)
+    site_area = site_data["area_m2"]
+
+    massing = {
+        "buildings": buildings,
+        "summary": {
+            "total_buildings": len(buildings),
+            "total_gross_area": total_gross,
+            "total_sellable_area": total_sell,
+            "density": round(total_gross / site_area, 2) if site_area else 0,
+            "source": "image_extraction",
+        },
+    }
+
+    return massing
+
+
 def main():
     parser = argparse.ArgumentParser(description="AI Massing Generator")
     parser.add_argument("--input", "-i", required=True, help="DWG/DXF файл с пятном застройки")
     parser.add_argument("--config", "-c", default="config.yaml", help="Конфигурация (YAML)")
     parser.add_argument("--output", "-o", help="Выходной файл (по умолчанию: <input>_massing.dwg)")
+    parser.add_argument("--from-image", help="Картинка массинга (рендер) → извлечь здания и валидировать")
+    parser.add_argument("--generate-image", action="store_true",
+                        help="Сгенерировать картинку массинга через FLUX, затем извлечь и валидировать")
+    parser.add_argument("--openrouter-key", help="OpenRouter API key (или env OPENROUTER_API_KEY)")
+    parser.add_argument("--vision-model", default="google/gemini-2.0-flash-001",
+                        help="Vision модель для OpenRouter (по умолчанию: gemini-2.0-flash)")
     parser.add_argument("--density", "-d", type=float, help="Макс. плотность застройки")
     parser.add_argument("--target-area", "-a", type=float, help="Целевая продаваемая площадь, м²")
     parser.add_argument("--region", "-r", help="Регион")
@@ -2334,6 +2723,128 @@ def main():
         site_data["existing_buildings"] = existing_buildings
         site_data["roads"] = roads
         site_data["parcels"] = parcels
+
+        # === Режим --generate-image: FLUX генерация + vision + нормы ===
+        # === Режим --from-image: vision + нормы ===
+        image_path = args.from_image
+        if args.generate_image and not image_path:
+            print("\n=== Режим GENERATE-IMAGE: FLUX → Vision → нормы ===")
+            out_dir = input_path.parent / "test_output" if "test_output" not in str(input_path) else input_path.parent
+            image_path = str(out_dir / "flux_generated.jpg")
+            Path(image_path).parent.mkdir(parents=True, exist_ok=True)
+            print("\nГенерация картинки через FLUX...")
+            generate_massing_image(site_data, config, image_path)
+
+        if image_path:
+            print(f"\n=== Режим FROM-IMAGE: {image_path} ===")
+
+            or_key = args.openrouter_key or __import__('os').environ.get("OPENROUTER_API_KEY")
+            if not or_key:
+                print("ОШИБКА: нужен --openrouter-key или env OPENROUTER_API_KEY для Vision API")
+                sys.exit(1)
+
+            print("\nИзвлечение зданий из картинки через Vision API...")
+            vision_result = extract_buildings_from_image(
+                image_path, site_data, openrouter_key=or_key, vision_model=args.vision_model
+            )
+
+            print("\nПривязка к координатам участка...")
+            massing = map_image_to_site(vision_result, site_data, config)
+            summary = massing.get("summary", {})
+            print(f"  Зданий: {summary.get('total_buildings', 0)}")
+            print(f"  Общая площадь: {summary.get('total_gross_area', 0)} м²")
+            print(f"  Плотность: {summary.get('density', 0)}")
+
+            # Валидация по нормам
+            print("\nВалидация по нормам...")
+            errors = validate_massing(massing, site_data, config)
+            if errors:
+                print(f"  Нарушений: {len(errors)}")
+                for err in errors:
+                    print(f"    - {err}")
+            else:
+                print("  Валидация: OK")
+
+            # Пост-обработка: обрезка по зоне застройки
+            print("\nПост-обработка...")
+            massing = clip_massing_to_buildable(massing, site_data, config)
+            summary = massing.get("summary", {})
+            print(f"  После обрезки: {summary.get('total_buildings', 0)} зданий")
+
+            # Расчёт квартир и паркинга
+            total_sell = summary.get("total_sellable_area", 0)
+            avg_apartment_m2 = 55
+            est_apartments = round(total_sell / avg_apartment_m2) if total_sell else 0
+            est_parking = round(est_apartments * 0.7)
+            est_residents = round(est_apartments * 2.3)
+            summary["est_apartments"] = est_apartments
+            summary["est_parking_spots"] = est_parking
+            summary["est_residents"] = est_residents
+            print(f"  Квартиры: ~{est_apartments} | Паркинг: ~{est_parking} | Жители: ~{est_residents}")
+
+            # Проверка инсоляции
+            print("\nПроверка инсоляции (22 марта, СанПиН)...")
+            insol_violations = check_insolation(massing, config)
+            if insol_violations:
+                print(f"  Нарушения инсоляции: {len(insol_violations)} зданий")
+                for v in insol_violations:
+                    print(f"    Здание {v['building_id']} ({v['floors']}эт): "
+                          f"макс. непрерывно {v['max_continuous']}ч (нужно {v['required']}ч)")
+                print("  Корректировка этажности...")
+                fix_insolation_violations(massing, insol_violations, config)
+                # Пересчёт summary после фикса
+                buildings = massing.get("buildings", [])
+                total_gross = sum(b.get("gross_area", 0) for b in buildings)
+                total_sell = sum(b.get("sellable_area", 0) for b in buildings)
+                massing["summary"]["total_gross_area"] = total_gross
+                massing["summary"]["total_sellable_area"] = total_sell
+                massing["summary"]["density"] = round(total_gross / site_data["area_m2"], 2)
+            else:
+                print("  Инсоляция: OK")
+
+            # Визуализация
+            viz_path = input_path.parent / "test_output" / "massing_from_image.png"
+            viz_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                visualize_massing(massing, site_data, str(viz_path), config=config)
+            except Exception as e:
+                print(f"  Визуализация не удалась: {e}")
+
+            # Запись DXF
+            output_dxf = Path(tmpdir) / f"{input_path.stem}_from_image.dxf"
+            write_massing_to_dxf(massing, site_data, str(output_dxf))
+
+            # Выходной файл
+            if args.output:
+                final_output = Path(args.output)
+            else:
+                final_output = input_path.parent / f"{input_path.stem}_from_image{input_path.suffix}"
+
+            if final_output.suffix.lower() == ".dwg":
+                print("Конвертация DXF → DWG...")
+                result_dwg = convert_dxf_to_dwg(str(output_dxf), str(final_output.parent), args.oda_path)
+                print(f"\nГотово: {result_dwg}")
+            else:
+                import shutil
+                shutil.copy2(str(output_dxf), str(final_output))
+                print(f"\nГотово: {final_output}")
+
+            # JSON с результатом
+            json_path = input_path.parent / "test_output" / "massing_from_image.json"
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(massing, f, ensure_ascii=False, indent=2)
+            print(f"JSON: {json_path}")
+
+            # Итоговый отчёт нарушений
+            errors_final = validate_massing(massing, site_data, config)
+            if errors_final:
+                print(f"\n⚠ Осталось нарушений: {len(errors_final)}")
+                for err in errors_final:
+                    print(f"  - {err}")
+            else:
+                print("\nВсе нормы соблюдены.")
+
+            return  # Выход из --from-image режима
 
         num_variants = min(args.variants, 5)
         all_results = []  # для сравнения вариантов
